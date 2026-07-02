@@ -1,0 +1,28 @@
+# Datos y archivos grandes
+*.csv
+*.xlsx
+*.zip
+*.XLSX
+Wells Fargo Bill File/
+
+# Temporales de Office
+~$*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.env/
+
+# Logs
+*.log
+
+# Sistema
+.DS_Store
+Thumbs.db
+
+# Entorno
+.env

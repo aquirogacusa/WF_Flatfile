@@ -1,0 +1,27 @@
+# Ignorar archivos de datos pesados para ahorrar tokens
+*.csv
+*.xlsx
+*.zip
+*.XLSX
+
+# Ignorar archivos temporales de Office
+~$*
+
+# Ignorar caches de Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Ignorar entornos virtuales
+venv/
+.venv/
+env/
+.env/
+
+# Ignorar logs
+*.log
+
+# Ignorar archivos del sistema
+.DS_Store
+Thumbs.db
