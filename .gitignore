@@ -26,3 +26,8 @@ Thumbs.db
 
 # Entorno
 .env
+
+# Archivos no necesarios
+Customers_SAP.txt
+error_screenshot.png
+pyhton.png
