@@ -390,16 +390,42 @@ def process_wells_fargo_files(base_path):
     # ===========================================================
     
     # Leer TXT exportado de SAP (Formato Spreadsheet es UTF-16, separado por tabs)
-    # Ignoramos las primeras 20 líneas de metadata del reporte ALV
+    # El layout del reporte ALV puede cambiar de orden: se localiza dinámicamente la fila
+    # de encabezados y se toman únicamente las columnas necesarias por nombre.
     try:
-        df_sap_raw = pd.read_csv(txt_path, sep='\t', encoding='utf-16', skiprows=20, header=None, on_bad_lines='skip')
+        with open(txt_path, 'r', encoding='utf-16') as f:
+            lines = f.readlines()
     except Exception as e:
         notify_failure("lectura del archivo de SAP", f"Error leyendo el archivo {txt_filename}: {e}")
         return False
-        
+
+    required_columns = ['Customer', 'Name 1', 'Terms Paym']
+    header_idx = None
+    for idx, line in enumerate(lines):
+        fields = [field.strip() for field in line.rstrip('\r\n').split('\t')]
+        if all(col in fields for col in required_columns):
+            header_idx = idx
+            break
+
+    if header_idx is None:
+        notify_failure(
+            "lectura del archivo de SAP",
+            f"No se encontraron las columnas {', '.join(required_columns)} en {txt_filename}. "
+            f"Verifique que el layout del reporte en SAP conserve estos encabezados.",
+        )
+        return False
+
+    try:
+        df_sap_raw = pd.read_csv(
+            txt_path, sep='\t', encoding='utf-16', skiprows=header_idx, header=0, on_bad_lines='skip'
+        )
+    except Exception as e:
+        notify_failure("lectura del archivo de SAP", f"Error leyendo el archivo {txt_filename}: {e}")
+        return False
+
     # 4. Procesar y filtrar datos de SAP
-    # Columnas esperadas en el TXT: 1: Customer, 2: Name 1, 4: Terms of payment
-    df_sap = df_sap_raw[[1, 2, 4]].copy()
+    # Se toman solo las columnas necesarias, sin importar su posición en el layout
+    df_sap = df_sap_raw[required_columns].copy()
     df_sap.columns = ['Customer_SAP', 'Name 1', 'Terms of payment']
     
     # Convertir a string
