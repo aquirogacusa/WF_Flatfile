@@ -195,6 +195,27 @@ def ensure_sap_running():
         logger.error(f"Error al intentar abrir SAP Logon: {e}")
         return False
 
+def export_sap_report_to_file(session, output_file):
+    # Exporta la lista ALV actual a un archivo local en formato Spreadsheet (UTF-16, tabs)
+    output_file = os.path.abspath(output_file)
+    out_dir = os.path.dirname(output_file)
+    out_name = os.path.basename(output_file)
+
+    logger.info(f"Exportando reporte a archivo de texto: {output_file}...")
+    session.findById("wnd[0]/mbar/menu[0]/menu[3]/menu[2]").select() # Local file...
+    time.sleep(1)
+
+    # Seleccionar formato Spreadsheet (texto tabulado)
+    session.findById("wnd[1]/usr/subSUBSCREEN_STEPLOOP:SAPLSPO5:0150/sub:SAPLSPO5:0150/radSPOPLI-SELFLAG[1,0]").select()
+    session.findById("wnd[1]/tbar[0]/btn[0]").press() # Continuar
+    time.sleep(1)
+
+    logger.info(f"Guardando en: {output_file}")
+    session.findById("wnd[1]/usr/ctxtDY_PATH").text = out_dir
+    session.findById("wnd[1]/usr/ctxtDY_FILENAME").text = out_name
+    session.findById("wnd[1]/tbar[0]/btn[11]").press() # Replace (Sobrescribir si existe)
+    time.sleep(3)
+
 def extract_sap_report(base_path):
     logger.info("Iniciando extracción de reporte desde SAP...")
     
@@ -249,31 +270,39 @@ def extract_sap_report(base_path):
         session.findById("wnd[1]/tbar[0]/btn[8]").press() # Execute (variante)
         time.sleep(1)
         
-        # Ejecutar reporte
+        # Ejecutar reporte (Partner Functions = ZA según variante CUSA-WF)
         logger.info("Ejecutando reporte...")
         session.findById("wnd[0]/tbar[1]/btn[8]").press() # Ejecutar F8
         time.sleep(5) # Esperar a que cargue el reporte
         
-        # Exportar a Archivo Local (TXT Spreadsheet)
-        logger.info("Exportando reporte a archivo de texto...")
-        session.findById("wnd[0]/mbar/menu[0]/menu[3]/menu[2]").select() # Local file...
-        time.sleep(1)
-        
-        # Seleccionar formato Spreadsheet (texto tabulado)
-        session.findById("wnd[1]/usr/subSUBSCREEN_STEPLOOP:SAPLSPO5:0150/sub:SAPLSPO5:0150/radSPOPLI-SELFLAG[1,0]").select()
-        session.findById("wnd[1]/tbar[0]/btn[0]").press() # Continuar
-        time.sleep(1)
-        
-        output_file = os.path.abspath(os.path.join(base_path, "Customers_SAP.txt"))
-        out_dir = os.path.dirname(output_file)
-        out_name = os.path.basename(output_file)
-        
-        logger.info(f"Guardando en: {output_file}")
-        session.findById("wnd[1]/usr/ctxtDY_PATH").text = out_dir
-        session.findById("wnd[1]/usr/ctxtDY_FILENAME").text = out_name
-        session.findById("wnd[1]/tbar[0]/btn[11]").press() # Replace (Sobrescribir si existe)
-        
-        time.sleep(3)
+        # Exportar a Archivo Local (TXT Spreadsheet) -> Customers_SAP.txt (proceso WF)
+        export_sap_report_to_file(session, os.path.join(base_path, "Customers_SAP.txt"))
+
+        # Segunda ejecución de la transacción con Partner Functions = Z5 -> Customers_SAP_Z5.txt
+        # (lo consume otro proceso, no el agente WF)
+        try:
+            logger.info("Regresando a la pantalla de selección para la segunda ejecución...")
+            session.findById("wnd[0]/tbar[0]/btn[3]").press() # Back (F3)
+            time.sleep(2)
+            logger.info("Cambiando Partner Functions a Z5...")
+            session.findById("wnd[0]/usr/ctxtP_PARVW-LOW").text = "Z5"
+            logger.info("Ejecutando reporte con Partner Functions = Z5...")
+            session.findById("wnd[0]/tbar[1]/btn[8]").press() # Ejecutar F8
+            time.sleep(5)
+            export_sap_report_to_file(session, os.path.join(base_path, "Customers_SAP_Z5.txt"))
+            logger.info("Reporte Z5 exportado correctamente.")
+        except Exception as e:
+            logger.error(f"No se pudo generar el archivo Customers_SAP_Z5.txt: {e}")
+            send_notification_email(
+                f"[ALERTA] {AGENT_NAME} - fallo al extraer reporte Z5 de SAP",
+                f"No fue posible extraer el reporte con Partner Functions = Z5 "
+                f"(transacción ZSD_POS_1052).\n\n"
+                f"Fecha/hora: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"Carpeta de datos: {os.path.abspath(base_path)}\n\n"
+                f"El archivo Customers_SAP.txt (Partner Functions = ZA) sí fue generado y el "
+                f"proceso de Wells Fargo continúa. El proceso que consume Customers_SAP_Z5.txt "
+                f"se verá afectado. Revise el log del agente para más información.\n"
+            )
         
         # Hacer logout
         logger.info("Cerrando sesión en SAP...")

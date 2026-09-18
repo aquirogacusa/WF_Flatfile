@@ -29,5 +29,6 @@ Thumbs.db
 
 # Archivos no necesarios
 Customers_SAP.txt
+variant_screen_dump.txt
 error_screenshot.png
 pyhton.png
