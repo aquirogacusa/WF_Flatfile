@@ -1,5 +1,6 @@
 pandas
 openpyxl
+xlrd
 pywin32
 python-dotenv
 pycryptodome

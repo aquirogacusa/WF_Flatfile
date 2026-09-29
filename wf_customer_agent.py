@@ -195,26 +195,196 @@ def ensure_sap_running():
         logger.error(f"Error al intentar abrir SAP Logon: {e}")
         return False
 
-def export_sap_report_to_file(session, output_file):
-    # Exporta la lista ALV actual a un archivo local en formato Spreadsheet (UTF-16, tabs)
+def _iter_sap_controls(component, max_depth=12):
+    # Recorre recursivamente el arbol de controles de un componente de SAP GUI
+    def walk(node, depth):
+        if depth > max_depth:
+            return
+        try:
+            children = list(node.Children)
+        except Exception:
+            return
+        for child in children:
+            yield child
+            yield from walk(child, depth + 1)
+
+    yield from walk(component, 0)
+
+def _select_menu_item_by_text(session, menu_path, text_prefix):
+    # Selecciona un item de menu por su texto para no depender de los indices (separadores)
+    try:
+        for item in session.findById(menu_path).Children:
+            try:
+                text = (item.Text or "").strip()
+            except Exception:
+                continue
+            if text.lower().startswith(text_prefix.lower()):
+                item.select()
+                return True
+    except Exception:
+        pass
+    return False
+
+def _select_spreadsheet_format(session):
+    # Si SAP muestra el dialogo "Select Spreadsheet", selecciona la opcion de Excel (preferir XXL).
+    # Si el dialogo no aparece (formato recordado por el usuario), continua directo al guardado.
+    try:
+        popup = session.findById("wnd[1]")
+    except Exception:
+        return
+
+    try:
+        session.findById("wnd[1]/usr/ctxtDY_PATH")
+        return  # Ya es el dialogo de guardado de archivo
+    except Exception:
+        pass
+
+    excel_radio = None
+    excel_xxl_radio = None
+    for control in _iter_sap_controls(popup):
+        try:
+            if control.Type != "GuiRadioButton":
+                continue
+            text = (control.Text or "").strip()
+        except Exception:
+            continue
+        lower = text.lower()
+        if "excel" not in lower:
+            continue
+        if "xxl" in lower:
+            excel_xxl_radio = control
+            break
+        if excel_radio is None:
+            excel_radio = control
+
+    chosen = excel_xxl_radio or excel_radio
+    if chosen is not None:
+        chosen.select()
+        logger.info(f"Formato de exportación seleccionado: {chosen.Text}")
+    else:
+        logger.warning("No se identificó el formato Excel en el diálogo 'Select Spreadsheet'; se usará el formato por defecto.")
+
+    session.findById("wnd[1]/tbar[0]/btn[0]").press() # Continuar
+    time.sleep(1)
+
+def _wait_for_save_dialog(session, timeout=20):
+    # Espera el dialogo estandar de guardado de archivo, cerrando popups intermedios
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            session.findById("wnd[1]/usr/ctxtDY_PATH")
+            return True
+        except Exception:
+            pass
+        try:
+            if session.findById("wnd[1]"):
+                session.findById("wnd[1]").sendVKey(0)
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return False
+
+def _close_unexpected_popup(session):
+    # Cierra popups (informativos o de confirmacion) que SAP pueda mostrar durante la exportacion
+    try:
+        popup = session.findById("wnd[1]")
+    except Exception:
+        return
+    try:
+        text = (popup.Text or "").strip()
+    except Exception:
+        text = ""
+    logger.warning(f"Cerrando diálogo de SAP durante la exportación: {text!r}")
+    for button_id in ("wnd[1]/usr/btnSPOP-OPTION1", "wnd[1]/tbar[0]/btn[0]"):
+        try:
+            session.findById(button_id).press()
+            return
+        except Exception:
+            continue
+    try:
+        popup.sendVKey(0)
+    except Exception:
+        pass
+
+def _wait_for_exported_file(session, output_file, since, timeout):
+    # Espera a que SAP genere el archivo Excel (mtime posterior al inicio de la exportacion)
+    base, ext = os.path.splitext(output_file)
+    candidates = [output_file]
+    for alt_ext in (".xlsx", ".xls"):
+        for candidate in (base + alt_ext, output_file + alt_ext):
+            # base + .xls cubre también .XLS (Windows no distingue mayúsculas);
+            # output_file + alt_ext cubre el caso en que SAP duplique la extensión
+            if candidate not in candidates:
+                candidates.append(candidate)
+
+    def new_file_size(candidate):
+        try:
+            if (
+                os.path.exists(candidate)
+                and os.path.getsize(candidate) > 0
+                and os.path.getmtime(candidate) + 2 >= since
+            ):
+                return os.path.getsize(candidate)
+        except OSError:
+            pass
+        return None
+
+    deadline = time.time() + timeout
+    last_sizes = {}
+    while time.time() < deadline:
+        for candidate in candidates:
+            size = new_file_size(candidate)
+            if size is None:
+                continue
+            if last_sizes.get(candidate) == size:
+                return candidate
+            last_sizes[candidate] = size
+        _close_unexpected_popup(session)
+        time.sleep(2)
+
+    for candidate in candidates:
+        if new_file_size(candidate) is not None:
+            return candidate
+    return None
+
+def export_sap_report_to_file(session, output_file, timeout=120):
+    # Exporta la lista ALV actual a un archivo Excel real usando List > Export > Spreadsheet
     output_file = os.path.abspath(output_file)
     out_dir = os.path.dirname(output_file)
     out_name = os.path.basename(output_file)
 
-    logger.info(f"Exportando reporte a archivo de texto: {output_file}...")
-    session.findById("wnd[0]/mbar/menu[0]/menu[3]/menu[2]").select() # Local file...
+    logger.info(f"Exportando reporte a Excel (Spreadsheet): {output_file}...")
+
+    # List > Export > Spreadsheet...
+    if not _select_menu_item_by_text(session, "wnd[0]/mbar/menu[0]/menu[3]", "Spreadsheet"):
+        session.findById("wnd[0]/mbar/menu[0]/menu[3]/menu[1]").select()
     time.sleep(1)
 
-    # Seleccionar formato Spreadsheet (texto tabulado)
-    session.findById("wnd[1]/usr/subSUBSCREEN_STEPLOOP:SAPLSPO5:0150/sub:SAPLSPO5:0150/radSPOPLI-SELFLAG[1,0]").select()
-    session.findById("wnd[1]/tbar[0]/btn[0]").press() # Continuar
-    time.sleep(1)
+    # Dialogo "Select Spreadsheet" (aparece cuando SAP ofrece varios formatos)
+    _select_spreadsheet_format(session)
+
+    # Dialogo estandar de guardado de archivo
+    if not _wait_for_save_dialog(session):
+        logger.error("No apareció el diálogo de guardado de archivo de SAP.")
+        return None
 
     logger.info(f"Guardando en: {output_file}")
     session.findById("wnd[1]/usr/ctxtDY_PATH").text = out_dir
     session.findById("wnd[1]/usr/ctxtDY_FILENAME").text = out_name
+    try:
+        session.findById("wnd[1]/usr/chkSCR-EXEC").selected = False  # No abrir Excel al finalizar
+    except Exception:
+        pass
+
+    export_started = time.time()
     session.findById("wnd[1]/tbar[0]/btn[11]").press() # Replace (Sobrescribir si existe)
-    time.sleep(3)
+
+    exported = _wait_for_exported_file(session, output_file, export_started, timeout)
+    if exported:
+        logger.info(f"Reporte exportado: {exported}")
+    else:
+        logger.error(f"El archivo Excel no se generó en {timeout} segundos: {output_file}")
+    return exported
 
 def extract_sap_report(base_path):
     logger.info("Iniciando extracción de reporte desde SAP...")
@@ -275,10 +445,12 @@ def extract_sap_report(base_path):
         session.findById("wnd[0]/tbar[1]/btn[8]").press() # Ejecutar F8
         time.sleep(5) # Esperar a que cargue el reporte
         
-        # Exportar a Archivo Local (TXT Spreadsheet) -> Customers_SAP.txt (proceso WF)
-        export_sap_report_to_file(session, os.path.join(base_path, "Customers_SAP.txt"))
+        # Exportar a Excel (Spreadsheet) -> Customers_SAP.xlsx (proceso WF)
+        exported = export_sap_report_to_file(session, os.path.join(base_path, "Customers_SAP.xlsx"))
+        if not exported:
+            raise RuntimeError("No fue posible exportar el reporte de clientes (Partner Function = ZA) desde SAP.")
 
-        # Segunda ejecución de la transacción con Partner Functions = Z5 -> Customers_SAP_Z5.txt
+        # Segunda ejecución de la transacción con Partner Functions = Z5 -> Customers_SAP_Z5.xlsx
         # (lo consume otro proceso, no el agente WF)
         try:
             logger.info("Regresando a la pantalla de selección para la segunda ejecución...")
@@ -289,18 +461,18 @@ def extract_sap_report(base_path):
             logger.info("Ejecutando reporte con Partner Functions = Z5...")
             session.findById("wnd[0]/tbar[1]/btn[8]").press() # Ejecutar F8
             time.sleep(5)
-            export_sap_report_to_file(session, os.path.join(base_path, "Customers_SAP_Z5.txt"))
+            export_sap_report_to_file(session, os.path.join(base_path, "Customers_SAP_Z5.xlsx"))
             logger.info("Reporte Z5 exportado correctamente.")
         except Exception as e:
-            logger.error(f"No se pudo generar el archivo Customers_SAP_Z5.txt: {e}")
+            logger.error(f"No se pudo generar el archivo Customers_SAP_Z5.xlsx: {e}")
             send_notification_email(
                 f"[ALERTA] {AGENT_NAME} - fallo al extraer reporte Z5 de SAP",
                 f"No fue posible extraer el reporte con Partner Functions = Z5 "
                 f"(transacción ZSD_POS_1052).\n\n"
                 f"Fecha/hora: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
                 f"Carpeta de datos: {os.path.abspath(base_path)}\n\n"
-                f"El archivo Customers_SAP.txt (Partner Functions = ZA) sí fue generado y el "
-                f"proceso de Wells Fargo continúa. El proceso que consume Customers_SAP_Z5.txt "
+                f"El archivo Customers_SAP.xlsx (Partner Functions = ZA) sí fue generado y el "
+                f"proceso de Wells Fargo continúa. El proceso que consume Customers_SAP_Z5.xlsx "
                 f"se verá afectado. Revise el log del agente para más información.\n"
             )
         
@@ -320,7 +492,58 @@ def extract_sap_report(base_path):
 
     except Exception as e:
         logger.error(f"Error en automatización SAP: {str(e)}")
+        # Evitar dejar una sesión de SAP abierta que bloquee la próxima ejecución
+        try:
+            subprocess.run(["taskkill", "/F", "/IM", "saplogon.exe"], capture_output=True)
+        except Exception:
+            pass
         return False
+
+def read_sap_report_excel(excel_path, required_columns):
+    # Lee el Excel exportado de SAP (Spreadsheet). Devuelve un DataFrame con todas las
+    # filas del reporte o None si no se encuentra la fila de encabezados.
+    last_error = None
+    raw = None
+    for attempt in range(3):
+        # Se prueban los engines por si el contenido no coincide con la extensión del archivo
+        for engine in (None, "openpyxl", "xlrd"):
+            try:
+                read_kwargs = {} if engine is None else {"engine": engine}
+                raw = pd.read_excel(excel_path, header=None, dtype=object, **read_kwargs)
+                break
+            except Exception as e:
+                last_error = e
+        if raw is not None:
+            break
+        time.sleep(3)
+    if raw is None:
+        raise last_error
+
+    header_idx = None
+    for idx in range(min(len(raw), 200)):
+        values = [str(v).strip() if pd.notna(v) else "" for v in raw.iloc[idx]]
+        if all(col in values for col in required_columns):
+            header_idx = idx
+            break
+
+    if header_idx is None:
+        return None
+
+    df = raw.iloc[header_idx + 1:].copy()
+    df.columns = [str(v).strip() if pd.notna(v) else "" for v in raw.iloc[header_idx]]
+    return df.dropna(how="all")
+
+def resolve_sap_excel_path(base_path, filename):
+    # SAP/Excel pueden guardar el reporte con extensión .xlsx o .xls: se resuelve cuál existe
+    expected = os.path.join(base_path, filename)
+    if os.path.exists(expected):
+        return expected
+    base = os.path.splitext(expected)[0]
+    for candidate in (base + ".xlsx", base + ".xls"):
+        if os.path.exists(candidate):
+            logger.info(f"Archivo exportado de SAP encontrado: {candidate}")
+            return candidate
+    return expected
 
 def process_wells_fargo_files(base_path):
     logger.info("=" * 70)
@@ -329,13 +552,13 @@ def process_wells_fargo_files(base_path):
 
     # 1. Ejecutar extracción de SAP
     if not extract_sap_report(base_path):
-        logger.warning("La extracción desde SAP no finalizó correctamente; se continuará con el archivo Customers_SAP.txt existente si está disponible.")
+        logger.warning("La extracción desde SAP no finalizó correctamente; se continuará con el archivo Customers_SAP.xlsx existente si está disponible.")
         send_notification_email(
             f"[ALERTA] {AGENT_NAME} - fallo al extraer reporte de SAP",
             f"No fue posible extraer el reporte de SAP (transacción ZSD_POS_1052).\n\n"
             f"Fecha/hora: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"Carpeta de datos: {os.path.abspath(base_path)}\n\n"
-            f"El agente continuó el proceso con el archivo Customers_SAP.txt existente "
+            f"El agente continuó el proceso con el archivo Customers_SAP.xlsx existente "
             f"(puede estar desactualizado). Revise el log del agente para más información.\n"
         )
     
@@ -347,12 +570,12 @@ def process_wells_fargo_files(base_path):
         "OUTPUT_ZIP_FILENAME",
         "Wells Fargo Bill File.zip",
     )
-    txt_filename = "Customers_SAP.txt"
+    sap_filename = "Customers_SAP.xlsx"
     csv_filename = "FlatFile.csv"
     
     input_zip_path = os.path.join(base_path, input_zip_filename)
     output_zip_path = os.path.join(base_path, output_zip_filename)
-    txt_path = os.path.join(base_path, txt_filename)
+    sap_path = resolve_sap_excel_path(base_path, sap_filename)
     temp_csv_path = os.path.join(base_path, csv_filename)
     
     # 2. Descomprimir el archivo zip
@@ -372,9 +595,9 @@ def process_wells_fargo_files(base_path):
         return False
     
     # 3. Leer archivos
-    logger.info(f"Leyendo archivos {csv_filename} y {txt_filename}...")
-    if not os.path.exists(txt_path):
-        notify_failure("lectura del archivo de SAP", f"No se encontró el archivo {txt_path}. Verifica que SAP exportó correctamente.")
+    logger.info(f"Leyendo archivos {csv_filename} y {sap_filename}...")
+    if not os.path.exists(sap_path):
+        notify_failure("lectura del archivo de SAP", f"No se encontró el archivo {sap_path}. Verifica que SAP exportó correctamente.")
         return False
 
     # Leer CSV con pandas, forzando tipos para la columna Auth.
@@ -435,38 +658,22 @@ def process_wells_fargo_files(base_path):
     # df_csv["URL"] = df_csv["Biller Invoice No."].apply(build_url)
     # ===========================================================
     
-    # Leer TXT exportado de SAP (Formato Spreadsheet es UTF-16, separado por tabs)
+    # Leer Excel exportado de SAP (List > Export > Spreadsheet)
     # El layout del reporte ALV puede cambiar de orden: se localiza dinámicamente la fila
     # de encabezados y se toman únicamente las columnas necesarias por nombre.
+    required_columns = ['Customer', 'Name 1', 'Terms Paym']
     try:
-        with open(txt_path, 'r', encoding='utf-16') as f:
-            lines = f.readlines()
+        df_sap_raw = read_sap_report_excel(sap_path, required_columns)
     except Exception as e:
-        notify_failure("lectura del archivo de SAP", f"Error leyendo el archivo {txt_filename}: {e}")
+        notify_failure("lectura del archivo de SAP", f"Error leyendo el archivo {sap_filename}: {e}")
         return False
 
-    required_columns = ['Customer', 'Name 1', 'Terms Paym']
-    header_idx = None
-    for idx, line in enumerate(lines):
-        fields = [field.strip() for field in line.rstrip('\r\n').split('\t')]
-        if all(col in fields for col in required_columns):
-            header_idx = idx
-            break
-
-    if header_idx is None:
+    if df_sap_raw is None:
         notify_failure(
             "lectura del archivo de SAP",
-            f"No se encontraron las columnas {', '.join(required_columns)} en {txt_filename}. "
+            f"No se encontraron las columnas {', '.join(required_columns)} en {sap_filename}. "
             f"Verifique que el layout del reporte en SAP conserve estos encabezados.",
         )
-        return False
-
-    try:
-        df_sap_raw = pd.read_csv(
-            txt_path, sep='\t', encoding='utf-16', skiprows=header_idx, header=0, on_bad_lines='skip'
-        )
-    except Exception as e:
-        notify_failure("lectura del archivo de SAP", f"Error leyendo el archivo {txt_filename}: {e}")
         return False
 
     # 4. Procesar y filtrar datos de SAP
@@ -484,7 +691,12 @@ def process_wells_fargo_files(base_path):
         # En caso de que se haya leído como float "0010380463.0"
         if code.endswith('.0'):
             code = code[:-2]
-        
+
+        # Excel puede exportar el código como número y perder los ceros a la izquierda:
+        # se restituye el relleno estándar de SAP (10 caracteres)
+        if code.isdigit() and len(code) < 10:
+            code = code.zfill(10)
+
         # Eliminar 2 ceros a la izquierda
         if len(code) == 10 and code.startswith('00'):
             return code[2:]
