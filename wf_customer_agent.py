@@ -377,11 +377,28 @@ def process_wells_fargo_files(base_path):
         notify_failure("lectura del archivo de SAP", f"No se encontró el archivo {txt_path}. Verifica que SAP exportó correctamente.")
         return False
 
-    # Leer CSV con pandas, forzando tipos para la columna Auth
-    try:
-        df_csv = pd.read_csv(temp_csv_path, dtype={"Auth": str})
-    except pd.errors.EmptyDataError:
-        df_csv = pd.DataFrame()
+    # Leer CSV con pandas, forzando tipos para la columna Auth.
+    # El archivo puede venir en UTF-8 o en Windows-1252 (según cómo lo exporte SAP BO/Excel),
+    # por lo que se intentan varias codificaciones antes de fallar.
+    csv_encodings = ("utf-8-sig", "utf-8", "cp1252", "latin-1")
+    for enc in csv_encodings:
+        try:
+            df_csv = pd.read_csv(temp_csv_path, dtype={"Auth": str}, encoding=enc)
+            if enc != "utf-8-sig":
+                logger.info(f"{csv_filename} leído con codificación {enc}.")
+            break
+        except UnicodeDecodeError:
+            logger.warning(f"No se pudo leer {csv_filename} con codificación {enc}. Probando la siguiente...")
+        except pd.errors.EmptyDataError:
+            df_csv = pd.DataFrame()
+            break
+    else:
+        notify_failure(
+            "lectura del archivo de entrada",
+            f"No fue posible decodificar {temp_csv_path} con ninguna de las codificaciones "
+            f"probadas: {', '.join(csv_encodings)}.",
+        )
+        return False
 
     # 3.1 CONTINGENCIA: el FlatFile.csv viene vacío (solo encabezado) por falla en la recarga de SAP BO.
     # No se puede enviar un archivo vacío a Wells Fargo: se anula el proceso y se alerta por correo.
