@@ -15,7 +15,12 @@ import argparse
 import shutil
 import time
 import subprocess
+import ctypes
+from ctypes import wintypes
 import win32com.client
+import win32gui
+import win32con
+import win32process
 # ===== COLUMNA URL DEL PDF: DESHABILITADA TEMPORALMENTE =====
 # Al habilitarla: descomentar estos imports, las funciones encrypt_invoice_no/build_url,
 # la asignación de df_csv["URL"] (paso 3.2) y el campo "URL" en new_rows (paso 6).
@@ -347,6 +352,288 @@ def _wait_for_exported_file(session, output_file, since, timeout):
             return candidate
     return None
 
+def _sap_process_ids():
+    # PIDs de los procesos del SAP GUI: el dialogo "Guardar como" de Windows pertenece a uno de ellos
+    pids = set()
+
+    def enum_callback(hwnd, _):
+        try:
+            class_name = win32gui.GetClassName(hwnd) or ""
+            if class_name.startswith("SAP_FRONTEND") or class_name == "SapGuiShell":
+                _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                pids.add(pid)
+        except Exception:
+            pass
+        return True
+
+    try:
+        win32gui.EnumWindows(enum_callback, None)
+    except Exception:
+        pass
+    return pids
+
+def _find_child_windows(parent, class_name):
+    matches = []
+
+    def enum_callback(hwnd, _):
+        try:
+            if (win32gui.GetClassName(hwnd) or "") == class_name:
+                matches.append(hwnd)
+        except Exception:
+            pass
+        return True
+
+    try:
+        win32gui.EnumChildWindows(parent, enum_callback, None)
+    except Exception:
+        pass
+    return matches
+
+def _get_dlg_item(hwnd, control_id):
+    # GetDlgItem lanza excepcion si el control no existe
+    try:
+        return win32gui.GetDlgItem(hwnd, control_id)
+    except Exception:
+        return 0
+
+def _find_button_by_text(hwnd_dlg, texts):
+    # Busca un boton por el texto (los dialogos modernos de Windows no usan IDs clasicos)
+    for button in _find_child_windows(hwnd_dlg, "Button"):
+        try:
+            text = (win32gui.GetWindowText(button) or "").strip().lower().replace("&", "")
+        except Exception:
+            continue
+        if text in texts:
+            return button
+    return 0
+
+class _GuiThreadInfo(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("hwndActive", wintypes.HWND),
+        ("hwndFocus", wintypes.HWND),
+        ("hwndCapture", wintypes.HWND),
+        ("hwndMenuOwner", wintypes.HWND),
+        ("hwndMoveSize", wintypes.HWND),
+        ("hwndCaret", wintypes.HWND),
+        ("rcCaret", wintypes.RECT),
+    ]
+
+def _get_focused_hwnd(hwnd):
+    # Control con el foco del hilo que posee la ventana
+    try:
+        tid, _ = win32process.GetWindowThreadProcessId(hwnd)
+        info = _GuiThreadInfo()
+        info.cbSize = ctypes.sizeof(_GuiThreadInfo)
+        if ctypes.windll.user32.GetGUIThreadInfo(tid, ctypes.byref(info)):
+            return info.hwndFocus or 0
+    except Exception:
+        pass
+    return 0
+
+def _find_filename_edit(hwnd_dlg):
+    # Campo "Nombre de archivo" del dialogo de guardado
+    combo = _get_dlg_item(hwnd_dlg, 1148)
+    if combo:
+        if (win32gui.GetClassName(combo) or "") == "Edit":
+            return combo
+        edits = _find_child_windows(combo, "Edit")
+        if edits:
+            return edits[0]
+    for edit in _find_child_windows(hwnd_dlg, "Edit"):
+        if win32gui.IsWindowVisible(edit) and (win32gui.GetWindowText(edit) or "").strip():
+            return edit
+    edits = [e for e in _find_child_windows(hwnd_dlg, "Edit") if win32gui.IsWindowVisible(e)]
+    return edits[0] if edits else None
+
+def _find_windows_save_dialog(timeout=60):
+    # Busca el dialogo nativo de Windows "Guardar como" que SAP abre para el export Spreadsheet
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        sap_pids = _sap_process_ids()
+        candidates = []
+
+        def enum_callback(hwnd, _):
+            try:
+                if not win32gui.IsWindowVisible(hwnd):
+                    return True
+                if (win32gui.GetClassName(hwnd) or "") != "#32770":
+                    return True
+                _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                if pid not in sap_pids:
+                    return True
+                candidates.append(hwnd)
+            except Exception:
+                pass
+            return True
+
+        try:
+            win32gui.EnumWindows(enum_callback, None)
+        except Exception:
+            pass
+        if candidates:
+            return candidates[0]
+        time.sleep(0.5)
+    return None
+
+def _has_confirm_dialog(sap_pids):
+    # Indica si hay una confirmacion de sobrescritura pendiente
+    found = []
+
+    def enum_callback(hwnd, _):
+        try:
+            if not win32gui.IsWindowVisible(hwnd):
+                return True
+            if (win32gui.GetClassName(hwnd) or "") != "#32770":
+                return True
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            if pid not in sap_pids:
+                return True
+            title = (win32gui.GetWindowText(hwnd) or "").strip().lower()
+            if "confirm" in title or _get_dlg_item(hwnd, 6):
+                found.append(hwnd)
+        except Exception:
+            pass
+        return True
+
+    try:
+        win32gui.EnumWindows(enum_callback, None)
+    except Exception:
+        pass
+    return found[0] if found else None
+
+def _press_save_in_windows_dialog(hwnd_dlg, edit):
+    # Intenta presionar "Guardar" por varias vias. Siempre con PostMessage (asincrono):
+    # un click modal puede abrir la confirmacion de sobrescritura y un SendMessage
+    # sincrono quedaria bloqueado esperando a que esa confirmacion se cierre.
+    attempts = []
+    save_button = _find_button_by_text(hwnd_dlg, ("save", "guardar")) or _get_dlg_item(hwnd_dlg, 1)
+    if save_button:
+        attempts.append(("click", save_button))
+    if edit:
+        attempts.append(("enter", edit))
+    attempts.append(("idok", hwnd_dlg))
+
+    sap_pids = _sap_process_ids()
+    for kind, target in attempts:
+        if not win32gui.IsWindow(hwnd_dlg):
+            return True
+        if _has_confirm_dialog(sap_pids):
+            return True  # Ya apareció la confirmación: la maneja _confirm_windows_overwrite
+        try:
+            if kind == "click":
+                win32gui.PostMessage(target, win32con.BM_CLICK, 0, 0)
+            elif kind == "enter":
+                win32gui.PostMessage(target, win32con.WM_KEYDOWN, win32con.VK_RETURN, 0)
+                win32gui.PostMessage(target, win32con.WM_KEYUP, win32con.VK_RETURN, 0)
+            else:
+                win32gui.PostMessage(target, win32con.WM_COMMAND, 1, 0)  # IDOK (boton por defecto)
+        except Exception:
+            continue
+        time.sleep(0.8)
+
+    if win32gui.IsWindow(hwnd_dlg) and not _has_confirm_dialog(sap_pids):
+        try:
+            win32gui.SetForegroundWindow(hwnd_dlg)
+        except Exception:
+            pass
+        win32com.client.Dispatch("WScript.Shell").SendKeys("{ENTER}")
+    return True
+
+def _fill_windows_save_dialog(hwnd_dlg, output_file):
+    # Escribe la ruta completa en el campo de nombre y confirma el guardado
+    edit = _find_filename_edit(hwnd_dlg)
+    written = False
+    if edit:
+        try:
+            win32gui.SendMessage(edit, win32con.WM_SETTEXT, 0, output_file)
+            written = output_file.lower() in (win32gui.GetWindowText(edit) or "").lower()
+        except Exception:
+            written = False
+
+    if written:
+        logger.info("Ruta escrita en el diálogo de guardado de Windows.")
+        _press_save_in_windows_dialog(hwnd_dlg, edit)
+        return
+
+    # Fallback: el campo de nombre tiene el foco al abrir el dialogo, se escribe con SendKeys
+    logger.warning("No se pudo escribir la ruta directamente; se usará SendKeys.")
+    try:
+        win32gui.SetForegroundWindow(hwnd_dlg)
+    except Exception:
+        pass
+    shell = win32com.client.Dispatch("WScript.Shell")
+    time.sleep(0.3)
+    shell.SendKeys("^a")
+    shell.SendKeys(output_file)  # la ruta no contiene caracteres especiales de SendKeys
+    time.sleep(0.5)
+    shell.SendKeys("{ENTER}")
+
+def _press_enter_in_dialog(hwnd_dlg):
+    # Envia Enter al control con el foco del dialogo (el aviso interno de sobrescritura
+    # de Windows 11 tiene el boton "Si" como accion por defecto)
+    target = _get_focused_hwnd(hwnd_dlg) or hwnd_dlg
+    try:
+        win32gui.PostMessage(target, win32con.WM_KEYDOWN, win32con.VK_RETURN, 0)
+        win32gui.PostMessage(target, win32con.WM_KEYUP, win32con.VK_RETURN, 0)
+    except Exception:
+        pass
+
+def _confirm_windows_overwrite(hwnd_save_dialog, timeout=15):
+    # Si el archivo ya existe, Windows pide confirmar la sobrescritura: puede ser una
+    # ventana separada ("Confirmar guardar como") o un aviso dentro del mismo dialogo.
+    # Devuelve True cuando ya no queda ninguna confirmacion pendiente.
+    deadline = time.time() + timeout
+    attempts = 0
+    while time.time() < deadline:
+        if not win32gui.IsWindow(hwnd_save_dialog):
+            return True  # El dialogo se cerro: ya no hay confirmacion pendiente
+
+        sap_pids = _sap_process_ids()
+        confirm_hwnd = _has_confirm_dialog(sap_pids)
+        if confirm_hwnd:
+            yes_button = _find_button_by_text(
+                confirm_hwnd, ("yes", "si", "sí", "aceptar", "continuar", "ok")
+            ) or _get_dlg_item(confirm_hwnd, 6)  # Confirmacion clasica
+            if yes_button:
+                win32gui.PostMessage(yes_button, win32con.BM_CLICK, 0, 0)
+            else:
+                _press_enter_in_dialog(confirm_hwnd)
+            logger.info("Confirmada la sobrescritura del archivo existente.")
+            time.sleep(0.6)
+            continue
+
+        # Aviso interno dentro del dialogo: Enter equivale a "Si"
+        attempts += 1
+        if attempts in (3, 6, 9, 12):
+            _press_enter_in_dialog(hwnd_save_dialog)
+        time.sleep(0.5)
+    return False
+
+def _move_previous_output(output_file, previous_file):
+    # Aparta el archivo anterior (respaldo temporal) para que Windows no pida
+    # confirmar la sobrescritura al exportar
+    try:
+        if os.path.exists(previous_file):
+            os.remove(previous_file)
+        if os.path.exists(output_file):
+            os.replace(output_file, previous_file)
+            logger.info(f"Archivo anterior apartado temporalmente: {previous_file}")
+            return True
+    except Exception as e:
+        logger.warning(f"No se pudo apartar el archivo anterior ({e}); se continuará sin respaldo.")
+    return False
+
+def _restore_previous_output(previous_file, output_file):
+    # Si la exportación falló, se restaura el archivo anterior para no perder el respaldo
+    try:
+        if os.path.exists(previous_file) and not os.path.exists(output_file):
+            os.replace(previous_file, output_file)
+            logger.warning("La exportación no generó archivo nuevo; se restauró el archivo anterior.")
+    except Exception as e:
+        logger.error(f"No se pudo restaurar el archivo anterior {previous_file}: {e}")
+
 def export_sap_report_to_file(session, output_file, timeout=120):
     # Exporta la lista ALV actual a un archivo Excel real usando List > Export > Spreadsheet
     output_file = os.path.abspath(output_file)
@@ -363,23 +650,49 @@ def export_sap_report_to_file(session, output_file, timeout=120):
     # Dialogo "Select Spreadsheet" (aparece cuando SAP ofrece varios formatos)
     _select_spreadsheet_format(session)
 
-    # Dialogo estandar de guardado de archivo
-    if not _wait_for_save_dialog(session):
-        logger.error("No apareció el diálogo de guardado de archivo de SAP.")
-        return None
+    # El dialogo de guardado varia segun la version del SAP GUI:
+    #  - SAP clasico (ctxtDY_PATH)
+    #  - Nativo de Windows "Guardar como" (no visible para SAP Scripting)
+    previous_file = output_file + ".previo"
+    moved_previous = False
 
-    logger.info(f"Guardando en: {output_file}")
-    session.findById("wnd[1]/usr/ctxtDY_PATH").text = out_dir
-    session.findById("wnd[1]/usr/ctxtDY_FILENAME").text = out_name
-    try:
-        session.findById("wnd[1]/usr/chkSCR-EXEC").selected = False  # No abrir Excel al finalizar
-    except Exception:
-        pass
+    if _wait_for_save_dialog(session, timeout=8):
+        logger.info(f"Guardando en (diálogo SAP): {output_file}")
+        session.findById("wnd[1]/usr/ctxtDY_PATH").text = out_dir
+        session.findById("wnd[1]/usr/ctxtDY_FILENAME").text = out_name
+        try:
+            session.findById("wnd[1]/usr/chkSCR-EXEC").selected = False  # No abrir Excel al finalizar
+        except Exception:
+            pass
 
-    export_started = time.time()
-    session.findById("wnd[1]/tbar[0]/btn[11]").press() # Replace (Sobrescribir si existe)
+        export_started = time.time()
+        session.findById("wnd[1]/tbar[0]/btn[11]").press() # Replace (Sobrescribir si existe)
+    else:
+        logger.info("Esperando el diálogo 'Guardar como' de Windows...")
+        hwnd_dlg = _find_windows_save_dialog(timeout=60)
+        if not hwnd_dlg:
+            logger.error("No apareció el diálogo de guardado (ni SAP ni Windows).")
+            return None
+
+        # Se aparta el archivo anterior para que Windows no muestre la confirmación
+        # de sobrescritura (el proceso siempre debe sobrescribir)
+        moved_previous = _move_previous_output(output_file, previous_file)
+
+        logger.info(f"Guardando en (diálogo Windows): {output_file}")
+        export_started = time.time()
+        _fill_windows_save_dialog(hwnd_dlg, output_file)
+        _confirm_windows_overwrite(hwnd_dlg)
 
     exported = _wait_for_exported_file(session, output_file, export_started, timeout)
+
+    if moved_previous:
+        if exported:
+            try:
+                os.remove(previous_file)
+            except Exception:
+                pass
+        else:
+            _restore_previous_output(previous_file, output_file)
     if exported:
         logger.info(f"Reporte exportado: {exported}")
     else:
