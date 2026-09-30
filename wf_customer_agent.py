@@ -786,6 +786,57 @@ def _close_exported_excel_file(file_path):
     except Exception:
         pass
 
+def _close_app_windows_for_file(file_path, timeout=12):
+    # SAP abre automáticamente el archivo exportado con la aplicación asociada. En los
+    # equipos sin Excel se abre con otra app (p. ej. Notepad) o aparece el diálogo
+    # "Elegir una aplicación": se cierran esas ventanas para no dejar el archivo bloqueado.
+    name = os.path.basename(file_path).lower()
+    dialogo_claves = (
+        "select an app",
+        "abrir con",
+        "open with",
+        "how do you want to open",
+        "cómo quieres abrir",
+        "selecciona una aplicaci",
+    )
+    deadline = time.time() + timeout
+    closed_titles = []
+    while time.time() < deadline:
+        matches = []
+
+        def enum_callback(hwnd, _):
+            try:
+                if not win32gui.IsWindowVisible(hwnd):
+                    return True
+                title = (win32gui.GetWindowText(hwnd) or "").strip()
+                lower = title.lower()
+                if name and name in lower:
+                    matches.append((hwnd, title))
+                elif ".xlsx" in lower and any(key in lower for key in dialogo_claves):
+                    matches.append((hwnd, title))
+            except Exception:
+                pass
+            return True
+
+        try:
+            win32gui.EnumWindows(enum_callback, None)
+        except Exception:
+            pass
+
+        for hwnd, title in matches:
+            try:
+                win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+                closed_titles.append(title)
+            except Exception:
+                pass
+
+        if closed_titles and not matches:
+            break
+        time.sleep(0.5)
+
+    if closed_titles:
+        logger.info(f"Se cerró la ventana que abrió el archivo exportado: {closed_titles[0]!r}")
+
 def _restore_previous_output(previous_file, output_file):
     # Si la exportación falló, se restaura el archivo anterior para no perder el respaldo
     try:
@@ -967,6 +1018,7 @@ def export_sap_report_to_file(session, output_file, timeout=180):
 
     if exported:
         _close_exported_excel_file(exported)
+        _close_app_windows_for_file(exported)
 
     if moved_previous:
         if exported:
@@ -1102,6 +1154,75 @@ def extract_sap_report(base_path):
         except Exception:
             pass
         return False
+
+def _parse_quoted_concatenated_flatfile(csv_path, encoding):
+    # SAP BO puede exportar el FlatFile sin delimitador, con los campos entre comillas:
+    #   "Payer Code""Auth""Customer"...
+    # Se extraen los valores entre comillas de cada línea.
+    rows = []
+    with open(csv_path, "r", encoding=encoding, errors="replace", newline="") as f:
+        for line in f:
+            line = line.rstrip("\r\n")
+            if not line:
+                continue
+            fields = re.findall(r'"([^"]*)"', line)
+            if fields:
+                rows.append(fields)
+    if len(rows) < 2:
+        return None
+    header = rows[0]
+    if "Auth" not in header:
+        return None
+    width = len(header)
+    data = [row for row in rows[1:] if len(row) == width]
+    return pd.DataFrame(data, columns=header)
+
+def read_flatfile_csv(csv_path):
+    # Lee el FlatFile.csv y devuelve (DataFrame, layout, encoding), o (None, None, None).
+    # Soporta el CSV estándar (separado por comas) y el formato de SAP BO sin delimitador.
+    encodings = ("utf-8-sig", "utf-8", "cp1252", "latin-1")
+    for enc in encodings:
+        try:
+            df = pd.read_csv(csv_path, dtype={"Auth": str}, encoding=enc)
+        except UnicodeDecodeError:
+            logger.warning(f"No se pudo leer el FlatFile con codificación {enc}. Probando la siguiente...")
+            continue
+        except pd.errors.EmptyDataError:
+            return pd.DataFrame(), "comma", enc
+        except Exception as e:
+            logger.warning(f"Error leyendo el FlatFile con codificación {enc}: {e}")
+            continue
+
+        if "Auth" in df.columns:
+            if enc != "utf-8-sig":
+                logger.info(f"FlatFile leído con codificación {enc} (CSV estándar).")
+            return df, "comma", enc
+
+        # El CSV estándar no encontró la columna Auth: probar el formato de SAP BO
+        df_quoted = _parse_quoted_concatenated_flatfile(csv_path, enc)
+        if df_quoted is not None:
+            logger.info(f"FlatFile leído con codificación {enc} (formato SAP BO sin delimitador).")
+            return df_quoted, "quoted", enc
+    return None, None, None
+
+def write_flatfile_csv(df, csv_path, layout, encoding="utf-8"):
+    # Guarda el FlatFile preservando el formato del archivo original
+    if layout == "quoted":
+        lines = ['"' + '""'.join(str(col).replace('"', " ") for col in df.columns) + '"']
+        for row in df.itertuples(index=False, name=None):
+            fields = []
+            for value in row:
+                try:
+                    empty = pd.isna(value)
+                except Exception:
+                    empty = False
+                text = "" if empty else str(value)
+                fields.append(text.replace('"', " "))  # las comillas romperían el formato
+            lines.append('"' + '""'.join(fields) + '"')
+        with open(csv_path, "w", encoding=encoding, errors="replace", newline="") as f:
+            f.write("\r\n".join(lines) + "\r\n")
+    else:
+        df.to_csv(csv_path, index=False, quoting=1) # quoting=1 (QUOTE_ALL)
 
 def _detect_sap_columns_without_header(raw, required_columns):
     # El export "Spreadsheet" de SAP GUI 8 no incluye la fila de encabezados: solo datos.
@@ -1278,26 +1399,15 @@ def process_wells_fargo_files(base_path):
         notify_failure("lectura del archivo de SAP", f"No se encontró el archivo {sap_path}. Verifica que SAP exportó correctamente.")
         return False
 
-    # Leer CSV con pandas, forzando tipos para la columna Auth.
-    # El archivo puede venir en UTF-8 o en Windows-1252 (según cómo lo exporte SAP BO/Excel),
-    # por lo que se intentan varias codificaciones antes de fallar.
-    csv_encodings = ("utf-8-sig", "utf-8", "cp1252", "latin-1")
-    for enc in csv_encodings:
-        try:
-            df_csv = pd.read_csv(temp_csv_path, dtype={"Auth": str}, encoding=enc)
-            if enc != "utf-8-sig":
-                logger.info(f"{csv_filename} leído con codificación {enc}.")
-            break
-        except UnicodeDecodeError:
-            logger.warning(f"No se pudo leer {csv_filename} con codificación {enc}. Probando la siguiente...")
-        except pd.errors.EmptyDataError:
-            df_csv = pd.DataFrame()
-            break
-    else:
+    # Leer CSV. Puede venir en UTF-8 o Windows-1252, y en dos formatos:
+    #  - CSV estándar separado por comas
+    #  - Formato de SAP BO sin delimitador: "campo1""campo2""campo3"
+    df_csv, csv_layout, csv_encoding = read_flatfile_csv(temp_csv_path)
+    if df_csv is None:
         notify_failure(
             "lectura del archivo de entrada",
-            f"No fue posible decodificar {temp_csv_path} con ninguna de las codificaciones "
-            f"probadas: {', '.join(csv_encodings)}.",
+            f"No fue posible leer/decodificar {temp_csv_path} en ninguno de los formatos "
+            f"ni codificaciones esperadas.",
         )
         return False
 
@@ -1417,8 +1527,8 @@ def process_wells_fargo_files(base_path):
         df_new = pd.DataFrame(new_rows)
         df_updated = pd.concat([df_csv, df_new], ignore_index=True)
 
-    # Guardar CSV actualizado
-    df_updated.to_csv(temp_csv_path, index=False, quoting=1) # quoting=1 (QUOTE_ALL)
+    # Guardar CSV actualizado (preservando el formato del archivo original)
+    write_flatfile_csv(df_updated, temp_csv_path, csv_layout, csv_encoding)
     logger.info(f"CSV actualizado guardado con {len(df_updated)} filas en total.")
 
     # 7. Repackage y Cleanup
