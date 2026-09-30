@@ -1,4 +1,5 @@
 import os
+import re
 import base64
 import zipfile
 import logging
@@ -14,9 +15,11 @@ from email.mime.text import MIMEText
 import argparse
 import shutil
 import time
+import threading
 import subprocess
 import ctypes
 from ctypes import wintypes
+import pythoncom
 import win32com.client
 import win32gui
 import win32con
@@ -290,7 +293,10 @@ def _wait_for_save_dialog(session, timeout=20):
     return False
 
 def _close_unexpected_popup(session):
-    # Cierra popups (informativos o de confirmacion) que SAP pueda mostrar durante la exportacion
+    # Cierra popups (informativos o de confirmacion) que SAP pueda mostrar durante la exportacion.
+    # Si hay un dialogo nativo de Windows abierto, las llamadas a SAP se bloquean: no tocar la sesion.
+    if _find_windows_save_dialog(timeout=0):
+        return
     try:
         popup = session.findById("wnd[1]")
     except Exception:
@@ -447,6 +453,18 @@ def _find_filename_edit(hwnd_dlg):
     edits = [e for e in _find_child_windows(hwnd_dlg, "Edit") if win32gui.IsWindowVisible(e)]
     return edits[0] if edits else None
 
+def _is_windows_save_dialog(hwnd):
+    # Debe ser el dialogo de archivos: se valida por titulo o por la estructura
+    # del dialogo moderno (DUIViewWndClassName), para no confundirlo con otras
+    # ventanas #32770 del proceso SAP (p.ej. "SAP Logon 800")
+    try:
+        title = (win32gui.GetWindowText(hwnd) or "").strip().lower()
+        if "save as" in title or "guardar como" in title:
+            return True
+        return bool(_find_child_windows(hwnd, "DUIViewWndClassName"))
+    except Exception:
+        return False
+
 def _find_windows_save_dialog(timeout=60):
     # Busca el dialogo nativo de Windows "Guardar como" que SAP abre para el export Spreadsheet
     deadline = time.time() + timeout
@@ -462,6 +480,8 @@ def _find_windows_save_dialog(timeout=60):
                     return True
                 _, pid = win32process.GetWindowThreadProcessId(hwnd)
                 if pid not in sap_pids:
+                    return True
+                if not _is_windows_save_dialog(hwnd):
                     return True
                 candidates.append(hwnd)
             except Exception:
@@ -541,8 +561,116 @@ def _press_save_in_windows_dialog(hwnd_dlg, edit):
         win32com.client.Dispatch("WScript.Shell").SendKeys("{ENTER}")
     return True
 
+def _uia_edit_text(edit):
+    try:
+        return edit.get_value() or ""
+    except Exception:
+        pass
+    try:
+        return edit.window_text() or ""
+    except Exception:
+        return ""
+
+def _fill_windows_save_dialog_uia(hwnd_dlg, output_file):
+    # Los dialogos modernos de Windows 10/11 (DirectUI) no aceptan WM_SETTEXT/GetWindowText
+    # cross-proceso, por lo que se usa UI Automation (pywinauto) para escribir la ruta.
+    try:
+        from pywinauto import Application
+    except ImportError:
+        logger.warning("pywinauto no está instalado; se usará el método clásico para el diálogo de guardado.")
+        return False
+
+    try:
+        app = Application(backend="uia").connect(handle=hwnd_dlg)
+        dlg = app.window(handle=hwnd_dlg)
+
+        edits = []
+        for control in dlg.descendants(control_type="Edit"):
+            try:
+                edits.append(control)
+            except Exception:
+                continue
+        if not edits:
+            logger.warning("UIA: no se encontró el campo de nombre de archivo.")
+            return False
+
+        edit = None
+        for control in edits:
+            try:
+                if control.element_info.automation_id == "1001":
+                    edit = control
+                    break
+            except Exception:
+                continue
+        if edit is None:
+            for control in edits:
+                try:
+                    name = (control.element_info.name or "").lower()
+                    if name.startswith("file name") or name.startswith("nombre"):
+                        edit = control
+                        break
+                except Exception:
+                    continue
+        if edit is None:
+            edit = edits[0]
+
+        text_ok = False
+        try:
+            edit.set_edit_text(output_file)
+            time.sleep(0.4)
+            text_ok = output_file.lower() in _uia_edit_text(edit).lower()
+        except Exception:
+            text_ok = False
+
+        if not text_ok:
+            edit.set_focus()
+            time.sleep(0.2)
+            dlg.type_keys("^a", pause=0.05)
+            dlg.type_keys(output_file, with_spaces=True, pause=0.02)
+            time.sleep(0.4)
+            text_ok = output_file.lower() in _uia_edit_text(edit).lower()
+
+        if not text_ok:
+            logger.warning("UIA: no se pudo escribir ni verificar la ruta en el diálogo de guardado.")
+            return False
+        logger.info("Ruta escrita en el diálogo de guardado (UIA).")
+
+        save_button = None
+        for control in dlg.descendants(control_type="Button"):
+            try:
+                if control.window_text().strip().lower() in ("save", "guardar"):
+                    save_button = control
+                    break
+            except Exception:
+                continue
+
+        if save_button is not None:
+            save_button.invoke()
+        else:
+            dlg.type_keys("{ENTER}")
+
+        # Verificación: el diálogo debe cerrarse (o quedar solo la confirmación de sobrescritura)
+        time.sleep(2)
+        if win32gui.IsWindow(hwnd_dlg) and not _has_confirm_dialog(_sap_process_ids()):
+            logger.warning("El diálogo de guardado sigue abierto; reintentando con Enter.")
+            try:
+                dlg.type_keys("{ENTER}")
+            except Exception:
+                pass
+            time.sleep(1)
+        logger.info("Guardado confirmado en el diálogo de Windows (UIA).")
+        return True
+    except Exception as e:
+        logger.warning(f"UI Automation falló en el diálogo de guardado: {e}")
+        return False
+
 def _fill_windows_save_dialog(hwnd_dlg, output_file):
-    # Escribe la ruta completa en el campo de nombre y confirma el guardado
+    # Escribe la ruta completa en el campo de nombre y confirma el guardado.
+    # Primero UI Automation (funciona con los diálogos modernos tipo DirectUI);
+    # si no está disponible, se usa el método clásico con SendMessage/SendKeys.
+    if _fill_windows_save_dialog_uia(hwnd_dlg, output_file):
+        return
+
     edit = _find_filename_edit(hwnd_dlg)
     written = False
     if edit:
@@ -625,6 +753,39 @@ def _move_previous_output(output_file, previous_file):
         logger.warning(f"No se pudo apartar el archivo anterior ({e}); se continuará sin respaldo.")
     return False
 
+def _close_exported_excel_file(file_path):
+    # SAP abre Excel automáticamente con el archivo exportado; se cierra para que no
+    # quede bloqueado (otro proceso lo lee y la siguiente ejecución lo reemplaza).
+    try:
+        excel = win32com.client.GetObject(Class="Excel.Application")
+    except Exception:
+        return
+    try:
+        excel.DisplayAlerts = False
+    except Exception:
+        pass
+    target = os.path.basename(file_path).lower()
+    closed_any = False
+    try:
+        for index in range(excel.Workbooks.Count, 0, -1):
+            try:
+                book = excel.Workbooks(index)
+                if os.path.basename(book.FullName).lower() == target:
+                    book.Close(SaveChanges=False)
+                    closed_any = True
+            except Exception:
+                continue
+    except Exception as e:
+        logger.warning(f"No se pudo cerrar el Excel del archivo exportado: {e}")
+        return
+    if closed_any:
+        logger.info("Se cerró el Excel abierto automáticamente por SAP.")
+    try:
+        if excel.Workbooks.Count == 0:
+            excel.Quit()
+    except Exception:
+        pass
+
 def _restore_previous_output(previous_file, output_file):
     # Si la exportación falló, se restaura el archivo anterior para no perder el respaldo
     try:
@@ -634,46 +795,161 @@ def _restore_previous_output(previous_file, output_file):
     except Exception as e:
         logger.error(f"No se pudo restaurar el archivo anterior {previous_file}: {e}")
 
-def export_sap_report_to_file(session, output_file, timeout=120):
-    # Exporta la lista ALV actual a un archivo Excel real usando List > Export > Spreadsheet
+def _refresh_sap_session(session=None):
+    # El export a Excel invalida la referencia COM de la sesión de SAP Scripting
+    # ("Object is not connected to server") aunque la sesión siga viva en SAP GUI:
+    # se re-adquiere una referencia nueva para continuar trabajando.
+    session_name = None
+    try:
+        session_name = session.Name
+    except Exception:
+        pass
+
+    application = win32com.client.GetObject("SAPGUI").GetScriptingEngine
+    target_connection = os.getenv("SAP_CONNECTION")
+    fallback = None
+    preferred = []
+    for connection in application.Children:
+        try:
+            description = connection.Description
+        except Exception:
+            description = None
+        try:
+            sessions = list(connection.Children)
+        except Exception:
+            continue
+        for candidate in sessions:
+            if fallback is None:
+                fallback = candidate
+            if target_connection and description == target_connection:
+                preferred.append(candidate)
+                try:
+                    if session_name and candidate.Name == session_name:
+                        return candidate
+                except Exception:
+                    continue
+    if preferred:
+        return preferred[-1]  # la sesión más reciente de la conexión del agente
+    if fallback is not None:
+        return fallback
+    raise RuntimeError("No hay ninguna sesión de SAP disponible.")
+
+def _select_spreadsheet_menu(session):
+    # Selecciona List > Export > Spreadsheet en un hilo aparte: en SAP GUI 8 el clic
+    # puede quedarse bloqueado hasta que el diálogo modal de Windows se cierre.
+    # Cada hilo que usa COM debe inicializar su propio apartamento (CoInitialize).
+    try:
+        pythoncom.CoInitialize()
+    except Exception:
+        pass
+    try:
+        try:
+            _select_spreadsheet_menu_run(session)
+        except Exception:
+            # Reintento con una referencia COM creada en este mismo hilo
+            sapgui = win32com.client.GetObject("SAPGUI")
+            sess = sapgui.GetScriptingEngine.Children(0).Children(0)
+            _select_spreadsheet_menu_run(sess)
+    except Exception as e:
+        logger.warning(f"No se pudo seleccionar el menú de exportación a Excel: {e}")
+    finally:
+        try:
+            pythoncom.CoUninitialize()
+        except Exception:
+            pass
+
+def _select_spreadsheet_menu_run(session):
+    if not _select_menu_item_by_text(session, "wnd[0]/mbar/menu[0]/menu[3]", "Spreadsheet"):
+        session.findById("wnd[0]/mbar/menu[0]/menu[3]/menu[1]").select()
+
+def _run_with_timeout(fn, timeout):
+    # Ejecuta fn() en un hilo aparte y espera hasta timeout segundos.
+    # Devuelve el resultado de fn(), o "timeout" si sigue bloqueada
+    # (p.ej. una llamada a SAP GUI Scripting bloqueada por un diálogo modal).
+    result = {}
+
+    def runner():
+        try:
+            pythoncom.CoInitialize()
+        except Exception:
+            pass
+        try:
+            result["value"] = fn()
+        except Exception as e:
+            result["error"] = e
+        finally:
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
+
+    thread = threading.Thread(target=runner, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        return "timeout"
+    if "error" in result:
+        raise result["error"]
+    return result.get("value")
+
+def _export_via_sap_dialogs(session, out_dir, out_name):
+    # Flujo para SAP GUI clásico: diálogos de SAP ("Select Spreadsheet" y archivo).
+    # Devuelve True si el guardado se inició correctamente.
+    _select_spreadsheet_format(session)
+    if not _wait_for_save_dialog(session, timeout=10):
+        return False
+    session.findById("wnd[1]/usr/ctxtDY_PATH").text = out_dir
+    logger.info(f"Guardando en (diálogo SAP): {os.path.join(out_dir, out_name)}")
+    session.findById("wnd[1]/usr/ctxtDY_FILENAME").text = out_name
+    try:
+        session.findById("wnd[1]/usr/chkSCR-EXEC").selected = False  # No abrir Excel al finalizar
+    except Exception:
+        pass
+    session.findById("wnd[1]/tbar[0]/btn[11]").press() # Replace (Sobrescribir si existe)
+    return True
+
+def export_sap_report_to_file(session, output_file, timeout=180):
+    # Exporta la lista ALV actual a un archivo Excel real usando List > Export > Spreadsheet.
+    # OJO: mientras hay un diálogo modal abierto (el "Guardar como" nativo de Windows),
+    # las llamadas a SAP GUI Scripting quedan bloqueadas; por eso no se debe llamar a
+    # session.findById() hasta que el diálogo se resuelva.
     output_file = os.path.abspath(output_file)
     out_dir = os.path.dirname(output_file)
     out_name = os.path.basename(output_file)
 
     logger.info(f"Exportando reporte a Excel (Spreadsheet): {output_file}...")
 
-    # List > Export > Spreadsheet...
-    if not _select_menu_item_by_text(session, "wnd[0]/mbar/menu[0]/menu[3]", "Spreadsheet"):
-        session.findById("wnd[0]/mbar/menu[0]/menu[3]/menu[1]").select()
-    time.sleep(1)
+    # List > Export > Spreadsheet... Se lanza en segundo plano porque la llamada a
+    # SAP puede quedar bloqueada hasta que el diálogo modal de Windows se cierre.
+    threading.Thread(target=_select_spreadsheet_menu, args=(session,), daemon=True).start()
+    time.sleep(2)
 
-    # Dialogo "Select Spreadsheet" (aparece cuando SAP ofrece varios formatos)
-    _select_spreadsheet_format(session)
-
-    # El dialogo de guardado varia segun la version del SAP GUI:
-    #  - SAP clasico (ctxtDY_PATH)
-    #  - Nativo de Windows "Guardar como" (no visible para SAP Scripting)
     previous_file = output_file + ".previo"
     moved_previous = False
+    export_started = None
 
-    if _wait_for_save_dialog(session, timeout=8):
-        logger.info(f"Guardando en (diálogo SAP): {output_file}")
-        session.findById("wnd[1]/usr/ctxtDY_PATH").text = out_dir
-        session.findById("wnd[1]/usr/ctxtDY_FILENAME").text = out_name
+    # 1) Esperar el diálogo nativo de Windows usando solo Win32 (sin tocar SAP).
+    #    La exportación puede tardar varios minutos en prepararse antes de mostrarlo.
+    hwnd_dlg = _find_windows_save_dialog(timeout=30)
+
+    # 2) Sin diálogo de Windows: probar el flujo clásico de SAP (GUI antiguos).
+    #    Se ejecuta en un hilo con timeout por si la sesión está bloqueada.
+    if hwnd_dlg is None:
         try:
-            session.findById("wnd[1]/usr/chkSCR-EXEC").selected = False  # No abrir Excel al finalizar
-        except Exception:
-            pass
+            classic_done = _run_with_timeout(
+                lambda: _export_via_sap_dialogs(session, out_dir, out_name), timeout=25
+            )
+        except Exception as e:
+            logger.warning(f"El flujo clásico de SAP falló: {e}")
+            classic_done = None
+        if classic_done is True:
+            export_started = time.time()
+        else:
+            # Sesión ocupada preparando la exportación: esperar con más paciencia
+            hwnd_dlg = _find_windows_save_dialog(timeout=300)
 
-        export_started = time.time()
-        session.findById("wnd[1]/tbar[0]/btn[11]").press() # Replace (Sobrescribir si existe)
-    else:
-        logger.info("Esperando el diálogo 'Guardar como' de Windows...")
-        hwnd_dlg = _find_windows_save_dialog(timeout=60)
-        if not hwnd_dlg:
-            logger.error("No apareció el diálogo de guardado (ni SAP ni Windows).")
-            return None
-
+    # 3) Resolver el diálogo nativo de Windows
+    if hwnd_dlg and export_started is None:
         # Se aparta el archivo anterior para que Windows no muestre la confirmación
         # de sobrescritura (el proceso siempre debe sobrescribir)
         moved_previous = _move_previous_output(output_file, previous_file)
@@ -683,7 +959,14 @@ def export_sap_report_to_file(session, output_file, timeout=120):
         _fill_windows_save_dialog(hwnd_dlg, output_file)
         _confirm_windows_overwrite(hwnd_dlg)
 
+    if export_started is None:
+        logger.error("No apareció ningún diálogo de guardado (ni SAP ni Windows).")
+        return None
+
     exported = _wait_for_exported_file(session, output_file, export_started, timeout)
+
+    if exported:
+        _close_exported_excel_file(exported)
 
     if moved_previous:
         if exported:
@@ -763,6 +1046,9 @@ def extract_sap_report(base_path):
         if not exported:
             raise RuntimeError("No fue posible exportar el reporte de clientes (Partner Function = ZA) desde SAP.")
 
+        # La referencia COM de la sesión queda desconectada tras el export: re-adquirirla
+        session = _refresh_sap_session(session)
+
         # Segunda ejecución de la transacción con Partner Functions = Z5 -> Customers_SAP_Z5.xlsx
         # (lo consume otro proceso, no el agente WF)
         try:
@@ -775,6 +1061,7 @@ def extract_sap_report(base_path):
             session.findById("wnd[0]/tbar[1]/btn[8]").press() # Ejecutar F8
             time.sleep(5)
             export_sap_report_to_file(session, os.path.join(base_path, "Customers_SAP_Z5.xlsx"))
+            session = _refresh_sap_session(session)
             logger.info("Reporte Z5 exportado correctamente.")
         except Exception as e:
             logger.error(f"No se pudo generar el archivo Customers_SAP_Z5.xlsx: {e}")
@@ -789,12 +1076,16 @@ def extract_sap_report(base_path):
                 f"se verá afectado. Revise el log del agente para más información.\n"
             )
         
-        # Hacer logout
+        # Hacer logout (mejor esfuerzo: un fallo aquí no debe invalidar una exportación exitosa)
         logger.info("Cerrando sesión en SAP...")
-        session.findById("wnd[0]/tbar[0]/btn[3]").press() # Back (F3)
-        session.findById("wnd[0]/tbar[0]/btn[3]").press() # Back (F3) again to home
-        session.findById("wnd[0]/tbar[0]/btn[15]").press() # Exit (Shift+F3)
-        session.findById("wnd[1]/usr/btnSPOP-OPTION1").press() # Yes to log off
+        try:
+            session = _refresh_sap_session(session)
+            session.findById("wnd[0]/tbar[0]/btn[3]").press() # Back (F3)
+            session.findById("wnd[0]/tbar[0]/btn[3]").press() # Back (F3) again to home
+            session.findById("wnd[0]/tbar[0]/btn[15]").press() # Exit (Shift+F3)
+            session.findById("wnd[1]/usr/btnSPOP-OPTION1").press() # Yes to log off
+        except Exception as e:
+            logger.warning(f"No se pudo cerrar la sesión de SAP correctamente: {e}")
         
         # Cerrar completamente SAP Logon
         logger.info("Cerrando aplicación SAP Logon...")
@@ -812,9 +1103,69 @@ def extract_sap_report(base_path):
             pass
         return False
 
+def _detect_sap_columns_without_header(raw, required_columns):
+    # El export "Spreadsheet" de SAP GUI 8 no incluye la fila de encabezados: solo datos.
+    # Se detectan las columnas por su contenido, usando como pista el layout conocido
+    # del reporte (Customer=2, Name 1=4, Terms Paym=29).
+    sample = raw.iloc[: min(len(raw), 500)]
+
+    def column_values(idx):
+        return [str(v).strip() for v in sample.iloc[:, idx].tolist() if pd.notna(v)]
+
+    # Customer: códigos con relleno de SAP ("00" + 8 dígitos)
+    customer_col = None
+    best_ratio = 0.0
+    for idx in range(raw.shape[1]):
+        values = column_values(idx)
+        if len(values) < 5:
+            continue
+        hits = sum(1 for v in values if re.fullmatch(r"00\d{8}", v))
+        ratio = hits / len(values)
+        if ratio > best_ratio:
+            best_ratio = ratio
+            customer_col = idx
+    if customer_col is None or best_ratio < 0.5:
+        # Pista de layout: columna 2
+        values = [str(v).strip() for v in raw.iloc[:, 2].tolist() if pd.notna(v)] if raw.shape[1] > 2 else []
+        hits = sum(1 for v in values if re.fullmatch(r"\d{8,10}", v))
+        if values and hits / len(values) >= 0.5:
+            customer_col = 2
+            best_ratio = hits / len(values)
+    if customer_col is None:
+        return None
+
+    # El resto de columnas se ubican respecto a Customer según el layout del reporte
+    offsets = {"Name 1": 2, "Terms Paym": 27}
+    detected = {"Customer": customer_col}
+    for name in required_columns:
+        if name == "Customer":
+            continue
+        offset = offsets.get(name)
+        idx = customer_col + offset if offset is not None else None
+        if idx is not None and 0 <= idx < raw.shape[1]:
+            detected[name] = idx
+
+    if "Terms Paym" in required_columns and "Terms Paym" not in detected:
+        # Búsqueda de respaldo: columna con valores tipo C030 / C008
+        best_ratio = 0.0
+        for idx in range(raw.shape[1]):
+            values = column_values(idx)
+            if len(values) < 5:
+                continue
+            hits = sum(1 for v in values if re.fullmatch(r"[A-Z]\d{3}", v))
+            ratio = hits / len(values)
+            if ratio > best_ratio:
+                best_ratio = ratio
+                detected["Terms Paym"] = idx
+        if best_ratio < 0.5:
+            detected.pop("Terms Paym", None)
+
+    logger.info(f"Columnas detectadas sin encabezado: {detected} (layout del reporte SAP)")
+    return detected
+
 def read_sap_report_excel(excel_path, required_columns):
-    # Lee el Excel exportado de SAP (Spreadsheet). Devuelve un DataFrame con todas las
-    # filas del reporte o None si no se encuentra la fila de encabezados.
+    # Lee el Excel exportado de SAP (Spreadsheet). Devuelve un DataFrame con las columnas
+    # requeridas, o None si no es posible identificarlas.
     last_error = None
     raw = None
     for attempt in range(3):
@@ -832,6 +1183,7 @@ def read_sap_report_excel(excel_path, required_columns):
     if raw is None:
         raise last_error
 
+    # Caso 1: el archivo trae la fila de encabezados (formatos anteriores)
     header_idx = None
     for idx in range(min(len(raw), 200)):
         values = [str(v).strip() if pd.notna(v) else "" for v in raw.iloc[idx]]
@@ -839,12 +1191,25 @@ def read_sap_report_excel(excel_path, required_columns):
             header_idx = idx
             break
 
-    if header_idx is None:
+    if header_idx is not None:
+        df = raw.iloc[header_idx + 1:].copy()
+        df.columns = [str(v).strip() if pd.notna(v) else "" for v in raw.iloc[header_idx]]
+        return df.dropna(how="all")
+
+    # Caso 2: el export moderno viene sin encabezados: se detectan las columnas por contenido
+    detected = _detect_sap_columns_without_header(raw, required_columns)
+    if detected is None:
         return None
 
-    df = raw.iloc[header_idx + 1:].copy()
-    df.columns = [str(v).strip() if pd.notna(v) else "" for v in raw.iloc[header_idx]]
-    return df.dropna(how="all")
+    data = raw.dropna(how="all").reset_index(drop=True)
+    result = pd.DataFrame()
+    for name in required_columns:
+        idx = detected.get(name)
+        if idx is None:
+            result[name] = ""
+        else:
+            result[name] = data.iloc[:, idx].values
+    return result.dropna(how="all")
 
 def resolve_sap_excel_path(base_path, filename):
     # SAP/Excel pueden guardar el reporte con extensión .xlsx o .xls: se resuelve cuál existe
