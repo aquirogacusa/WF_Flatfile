@@ -760,6 +760,167 @@ def _confirm_windows_overwrite(hwnd_save_dialog, timeout=15):
         time.sleep(0.5)
     return False
 
+def _is_modern_save_dialog(hwnd_dlg):
+    # Diálogo moderno de Windows 10/11 (DirectUI): no acepta WM_SETTEXT cross-proceso
+    # de forma confiable, por lo que se maneja sin digitar.
+    return bool(_find_child_windows(hwnd_dlg, "DUIViewWndClassName"))
+
+def _default_sap_save_folder():
+    folder = os.path.join(os.path.expanduser("~"), "Documents", "SAP", "SAP GUI")
+    return folder if os.path.isdir(folder) else None
+
+def _dialog_current_folder_win32(hwnd_dlg):
+    # Lee la carpeta actual del diálogo desde su barra de direcciones (solo lectura)
+    for toolbar in _find_child_windows(hwnd_dlg, "ToolbarWindow32"):
+        try:
+            text = (win32gui.GetWindowText(toolbar) or "").strip()
+        except Exception:
+            continue
+        lower = text.lower()
+        for prefix in ("address:", "dirección:", "direccion:"):
+            if lower.startswith(prefix):
+                folder = text[len(prefix):].strip()
+                if folder and os.path.isdir(folder):
+                    return folder
+        if text and os.path.isdir(text):
+            return text
+    return None
+
+def _read_save_dialog_defaults(hwnd_dlg):
+    # Lee (carpeta, nombre por defecto) del diálogo SIN digitar nada, para luego
+    # mover el archivo a la ruta destino. Funciona sin sesión interactiva.
+    try:
+        from pywinauto import Application
+    except ImportError:
+        return None
+    try:
+        app = Application(backend="uia").connect(handle=hwnd_dlg)
+        dlg = app.window(handle=hwnd_dlg)
+    except Exception:
+        return None
+
+    filename = None
+    try:
+        for control in dlg.descendants(control_type="Edit"):
+            try:
+                label = (control.element_info.name or "").lower()
+                if "file name" in label or "nombre" in label:
+                    filename = (control.get_value() or control.window_text() or "").strip()
+                    break
+            except Exception:
+                continue
+    except Exception:
+        pass
+    if not filename:
+        return None
+
+    if not os.path.splitext(filename)[1]:
+        ext = None
+        try:
+            for control in dlg.descendants(control_type="ComboBox"):
+                try:
+                    text = (control.window_text() or "").strip()
+                except Exception:
+                    continue
+                found = re.search(r"\(\*(\.\w+)\)", text)
+                if found:
+                    ext = found.group(1)
+                    break
+        except Exception:
+            pass
+        filename = filename + (ext or ".xlsx")
+
+    folder = _dialog_current_folder_win32(hwnd_dlg) or _default_sap_save_folder()
+    if not folder:
+        return None
+    return folder, filename
+
+def _press_save(hwnd_dlg):
+    # Presiona "Guardar" en el diálogo sin usar el teclado (funciona sin sesión interactiva)
+    try:
+        from pywinauto import Application
+        dlg = Application(backend="uia").connect(handle=hwnd_dlg).window(handle=hwnd_dlg)
+        for control in dlg.descendants(control_type="Button"):
+            try:
+                if control.window_text().strip().lower() in ("save", "guardar"):
+                    control.invoke()
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    try:
+        save_button = _find_button_by_text(hwnd_dlg, ("save", "guardar")) or _get_dlg_item(hwnd_dlg, 1)
+        if save_button:
+            win32gui.PostMessage(save_button, win32con.BM_CLICK, 0, 0)
+            return True
+    except Exception:
+        pass
+    return False
+
+def _wait_for_new_file(path, since, timeout, poll=2):
+    deadline = time.time() + timeout
+    last_size = None
+    while time.time() < deadline:
+        try:
+            if os.path.exists(path) and os.path.getsize(path) > 0 and os.path.getmtime(path) + 2 >= since:
+                size = os.path.getsize(path)
+                if last_size == size:
+                    return path
+                last_size = size
+        except OSError:
+            pass
+        time.sleep(poll)
+    return None
+
+def _copy_with_retry(src, dst, attempts=8):
+    import shutil as _shutil
+    for _ in range(attempts):
+        try:
+            _shutil.copy2(src, dst)
+            return True
+        except OSError:
+            time.sleep(1)
+    return False
+
+def _save_windows_dialog_to_target(hwnd_dlg, output_file):
+    # Guarda el archivo del diálogo de Windows directamente en la ruta destino.
+    # Estrategia principal (sin teclado, funciona sin sesión interactiva): se deja el
+    # nombre por defecto del diálogo, se presiona Guardar, se cierra la app que SAP
+    # abre automáticamente y se COPIA el archivo a la ruta destino (sin borrar el
+    # original para no dejar colgado a SAP si aún lo está abriendo).
+    if _is_modern_save_dialog(hwnd_dlg):
+        defaults = _read_save_dialog_defaults(hwnd_dlg)
+        if defaults:
+            folder, default_name = defaults
+            default_file = os.path.join(folder, default_name)
+            logger.info(f"El diálogo propone guardar como: {default_file}")
+            try:
+                if os.path.exists(default_file):
+                    os.remove(default_file)
+                    logger.info("Se eliminó el archivo por defecto anterior para evitar la confirmación.")
+            except Exception as e:
+                logger.warning(f"No se pudo eliminar el archivo por defecto del diálogo: {e}")
+            pressed_at = time.time()
+            if _press_save(hwnd_dlg):
+                _confirm_windows_overwrite(hwnd_dlg)
+                found = _wait_for_new_file(default_file, pressed_at - 5, timeout=90)
+                if found:
+                    time.sleep(2)  # Dar tiempo a que SAP abra el archivo con la app asociada
+                    _close_exported_excel_file(default_file)
+                    _close_app_windows_for_file(default_file)
+                    if _copy_with_retry(default_file, output_file):
+                        logger.info(f"Archivo copiado a la ruta destino: {output_file}")
+                        return True
+                    logger.error("No se pudo copiar el archivo generado a la ruta destino.")
+                    return False
+            logger.warning("No apareció el archivo por defecto del diálogo; se intentará escribir la ruta.")
+
+    # Respaldo: escribir la ruta completa en el campo de nombre (requiere sesión interactiva)
+    _fill_windows_save_dialog(hwnd_dlg, output_file)
+    _confirm_windows_overwrite(hwnd_dlg)
+    return True
+
 def _move_previous_output(output_file, previous_file):
     # Aparta el archivo anterior (respaldo temporal) para que Windows no pida
     # confirmar la sobrescritura al exportar
@@ -1041,7 +1202,9 @@ def export_sap_report_to_file(session, output_file, timeout=180):
 
         logger.info(f"Guardando en (diálogo Windows): {output_file}")
         export_started = time.time()
-        _fill_windows_save_dialog(hwnd_dlg, output_file)
+        if not _save_windows_dialog_to_target(hwnd_dlg, output_file):
+            logger.error("No fue posible guardar el archivo desde el diálogo de Windows.")
+            return None
         _confirm_windows_overwrite(hwnd_dlg)
 
     if export_started is None:
