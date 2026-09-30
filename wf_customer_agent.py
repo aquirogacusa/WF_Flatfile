@@ -594,41 +594,62 @@ def _fill_windows_save_dialog_uia(hwnd_dlg, output_file):
             logger.warning("UIA: no se encontró el campo de nombre de archivo.")
             return False
 
+        logger.info(f"UIA: {len(edits)} controles Edit en el diálogo.")
+        for control in edits:
+            try:
+                info = control.element_info
+                logger.info(
+                    f"  Edit: name={info.name!r} auto_id={info.automation_id!r} "
+                    f"top={control.rectangle().top} valor={(_uia_edit_text(control) or '')[:40]!r}"
+                )
+            except Exception:
+                continue
+
+        # Se elige el campo "Nombre de archivo" por su etiqueta accesible y, si no hay,
+        # el Edit más abajo en el diálogo (el buscador está arriba a la derecha).
         edit = None
         for control in edits:
             try:
-                if control.element_info.automation_id == "1001":
+                label = (control.element_info.name or "").lower()
+                if "file name" in label or "nombre" in label:
                     edit = control
                     break
             except Exception:
                 continue
         if edit is None:
+            best_top = None
             for control in edits:
                 try:
-                    name = (control.element_info.name or "").lower()
-                    if name.startswith("file name") or name.startswith("nombre"):
-                        edit = control
-                        break
+                    top = control.rectangle().top
                 except Exception:
                     continue
+                if best_top is None or top > best_top:
+                    best_top = top
+                    edit = control
         if edit is None:
-            edit = edits[0]
+            logger.warning("UIA: no se encontró el campo de nombre de archivo.")
+            return False
 
+        # Se escribe con teclado real (igual que un usuario) para que el diálogo
+        # procese la ruta como si se digitara; ValuePattern queda como respaldo.
         text_ok = False
         try:
-            edit.set_edit_text(output_file)
-            time.sleep(0.4)
+            edit.set_focus()
+            time.sleep(0.3)
+            edit.type_keys("^a", pause=0.05)
+            edit.type_keys(output_file, with_spaces=True, pause=0.01)
+            time.sleep(0.5)
             text_ok = output_file.lower() in _uia_edit_text(edit).lower()
-        except Exception:
-            text_ok = False
+        except Exception as e:
+            logger.warning(f"UIA: no se pudo escribir con teclado: {e}")
 
         if not text_ok:
-            edit.set_focus()
-            time.sleep(0.2)
-            dlg.type_keys("^a", pause=0.05)
-            dlg.type_keys(output_file, with_spaces=True, pause=0.02)
-            time.sleep(0.4)
-            text_ok = output_file.lower() in _uia_edit_text(edit).lower()
+            try:
+                edit.set_edit_text(output_file)
+                time.sleep(0.4)
+                text_ok = output_file.lower() in _uia_edit_text(edit).lower()
+            except Exception:
+                pass
 
         if not text_ok:
             logger.warning("UIA: no se pudo escribir ni verificar la ruta en el diálogo de guardado.")
@@ -790,7 +811,10 @@ def _close_app_windows_for_file(file_path, timeout=12):
     # SAP abre automáticamente el archivo exportado con la aplicación asociada. En los
     # equipos sin Excel se abre con otra app (p. ej. Notepad) o aparece el diálogo
     # "Elegir una aplicación": se cierran esas ventanas para no dejar el archivo bloqueado.
+    # También se cierran restos con el nombre por defecto "export.xlsx" que SAP usa si el
+    # guardado no tomó la ruta indicada.
     name = os.path.basename(file_path).lower()
+    default_name = "export.xlsx"
     dialogo_claves = (
         "select an app",
         "abrir con",
@@ -811,6 +835,8 @@ def _close_app_windows_for_file(file_path, timeout=12):
                 title = (win32gui.GetWindowText(hwnd) or "").strip()
                 lower = title.lower()
                 if name and name in lower:
+                    matches.append((hwnd, title))
+                elif default_name in lower:
                     matches.append((hwnd, title))
                 elif ".xlsx" in lower and any(key in lower for key in dialogo_claves):
                     matches.append((hwnd, title))
@@ -886,23 +912,31 @@ def _refresh_sap_session(session=None):
     raise RuntimeError("No hay ninguna sesión de SAP disponible.")
 
 def _select_spreadsheet_menu(session):
-    # Selecciona List > Export > Spreadsheet en un hilo aparte: en SAP GUI 8 el clic
-    # puede quedarse bloqueado hasta que el diálogo modal de Windows se cierre.
-    # Cada hilo que usa COM debe inicializar su propio apartamento (CoInitialize).
+    # Inicia la exportación de la lista actual a Excel: primero se intenta Shift+F9
+    # (acceso directo de SAP GUI a List > Export > Spreadsheet) y, si no está
+    # disponible, la ruta de menú. Se ejecuta en un hilo aparte porque en SAP GUI 8
+    # la llamada puede quedarse bloqueada hasta que el diálogo modal de Windows
+    # se cierre. Cada hilo que usa COM debe inicializar su propio apartamento.
     try:
         pythoncom.CoInitialize()
     except Exception:
         pass
     try:
         try:
-            _select_spreadsheet_menu_run(session)
+            session.findById("wnd[0]").sendVKey(21)  # Shift+F9: exportar a Spreadsheet
         except Exception:
+            _select_spreadsheet_menu_run(session)
+    except Exception:
+        try:
             # Reintento con una referencia COM creada en este mismo hilo
             sapgui = win32com.client.GetObject("SAPGUI")
             sess = sapgui.GetScriptingEngine.Children(0).Children(0)
-            _select_spreadsheet_menu_run(sess)
-    except Exception as e:
-        logger.warning(f"No se pudo seleccionar el menú de exportación a Excel: {e}")
+            try:
+                sess.findById("wnd[0]").sendVKey(21)
+            except Exception:
+                _select_spreadsheet_menu_run(sess)
+        except Exception as e:
+            logger.warning(f"No se pudo iniciar la exportación a Excel desde SAP: {e}")
     finally:
         try:
             pythoncom.CoUninitialize()
