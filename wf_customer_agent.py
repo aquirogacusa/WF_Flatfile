@@ -1541,6 +1541,71 @@ def resolve_sap_excel_path(base_path, filename):
             return candidate
     return expected
 
+def run_customers_master_merge(base_path):
+    # Genera el "Maestro Clientes" combinando Customers_SAP.xlsx + Customers_SAP_Z5.xlsx.
+    # Delega en el agente de C:\AIWorkspace\Customers Master Data; un fallo aqui NO
+    # interrumpe el proceso de Wells Fargo, solo genera alerta por correo.
+    if os.getenv("CUSTOMER_MERGE_ENABLED", "true").strip().lower() not in ("1", "true", "yes"):
+        logger.info("Merge de Maestro Clientes deshabilitado (CUSTOMER_MERGE_ENABLED=false).")
+        return True
+
+    agent_dir = os.getenv("CUSTOMER_MERGE_AGENT_PATH", r"C:\AIWorkspace\Customers Master Data").strip()
+    script = os.path.join(agent_dir, "customers_agent.py")
+    if not os.path.isfile(script):
+        msg = f"No se encontro el agente de merge en {script}"
+        logger.error(msg)
+        send_notification_email(
+            f"[ALERTA] {AGENT_NAME} - fallo al generar Maestro Clientes",
+            f"{msg}\n\nFecha/hora: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        )
+        return False
+
+    env = os.environ.copy()
+    env["SOURCE_FOLDER"] = base_path
+    env["BASE_FILE_NAME"] = os.getenv("CUSTOMER_MERGE_BASE_FILE_NAME", "Customers_SAP.xlsx")
+    env["Z5_FILE_NAME"] = os.getenv("CUSTOMER_MERGE_Z5_FILE_NAME", "Customers_SAP_Z5.xlsx")
+    out_full = os.getenv("CUSTOMER_MERGE_OUTPUT_FILE_NAME", "").strip()
+    if out_full:
+        env["OUTPUT_FILE_NAME"] = out_full
+        env.pop("OUTPUT_BASE_NAME", None)
+    else:
+        env.pop("OUTPUT_FILE_NAME", None)
+        env["OUTPUT_BASE_NAME"] = os.getenv("CUSTOMER_MERGE_OUTPUT_BASE_NAME", "Maestro Clientes")
+
+    logger.info("Generando Maestro Clientes (merge SAP + Z5)...")
+    try:
+        result = subprocess.run(
+            [sys.executable, script],
+            cwd=agent_dir, capture_output=True, text=True, timeout=1800, env=env,
+        )
+    except Exception as e:
+        logger.error(f"No se pudo ejecutar el agente de merge: {e}")
+        send_notification_email(
+            f"[ALERTA] {AGENT_NAME} - fallo al generar Maestro Clientes",
+            f"Error al lanzar el merge de clientes:\n{e}\n\n"
+            f"Carpeta de datos: {base_path}\n"
+            f"Fecha/hora: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        )
+        return False
+
+    for line in (result.stdout or "").splitlines():
+        logger.info(f"[MERGE] {line}")
+    if result.returncode == 0:
+        logger.info("Maestro Clientes generado correctamente.")
+        return True
+
+    for line in (result.stderr or "").splitlines():
+        logger.error(f"[MERGE] {line}")
+    send_notification_email(
+        f"[ALERTA] {AGENT_NAME} - fallo al generar Maestro Clientes",
+        f"El merge de Customers_SAP.xlsx + Customers_SAP_Z5.xlsx termino con codigo "
+        f"{result.returncode}.\n\n"
+        f"Carpeta de datos: {base_path}\n"
+        f"Fecha/hora: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        f"Salida del agente:\n{result.stdout or ''}\n{result.stderr or ''}\n"
+    )
+    return False
+
 def process_wells_fargo_files(base_path):
     logger.info("=" * 70)
     logger.info(f"Inicio de ejecución - {AGENT_NAME}")
@@ -1557,6 +1622,9 @@ def process_wells_fargo_files(base_path):
             f"El agente continuó el proceso con el archivo Customers_SAP.xlsx existente "
             f"(puede estar desactualizado). Revise el log del agente para más información.\n"
         )
+
+    # 1.1 Maestro Clientes: merge de Customers_SAP.xlsx + Customers_SAP_Z5.xlsx
+    run_customers_master_merge(base_path)
     
     input_zip_filename = os.getenv(
         "INPUT_ZIP_FILENAME",
