@@ -1607,6 +1607,68 @@ def run_customers_master_merge(base_path):
     )
     return False
 
+def run_easyroute_upload(base_path):
+    # Genera "Upload EasyRoute MM.DD.YYYY.xlsx" filtrando el Maestro Clientes por
+    # los codigos de vendedor de Sales Rep DSD.xlsx (easyroute_agent.py en este repo).
+    # Un fallo aqui NO interrumpe el proceso de Wells Fargo, solo genera alerta por correo.
+    if os.getenv("EASYROUTE_ENABLED", "true").strip().lower() not in ("1", "true", "yes"):
+        logger.info("Proceso Upload EasyRoute deshabilitado (EASYROUTE_ENABLED=false).")
+        return True
+
+    agent_dir = os.getenv("EASYROUTE_AGENT_PATH", "").strip() or os.path.dirname(os.path.abspath(__file__))
+    script = os.path.join(agent_dir, "easyroute_agent.py")
+    if not os.path.isfile(script):
+        msg = f"No se encontro el agente de Upload EasyRoute en {script}"
+        logger.error(msg)
+        send_notification_email(
+            f"[ALERTA] {AGENT_NAME} - fallo al generar Upload EasyRoute",
+            f"{msg}\n\nFecha/hora: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        )
+        return False
+
+    env = os.environ.copy()
+    env["SOURCE_FOLDER"] = base_path
+    maestro_name = os.getenv("CUSTOMER_MERGE_OUTPUT_FILE_NAME", "").strip()
+    if maestro_name:
+        env["MAESTRO_FILE_NAME"] = maestro_name
+    upload_name = os.getenv("EASYROUTE_OUTPUT_FILE_NAME", "").strip()
+    if upload_name:
+        env["UPLOAD_FILE_NAME"] = upload_name
+
+    logger.info("Generando Upload EasyRoute (maestro filtrado por vendedores DSD)...")
+    try:
+        result = subprocess.run(
+            [sys.executable, script],
+            cwd=agent_dir, capture_output=True, text=True, timeout=1800, env=env,
+        )
+    except Exception as e:
+        logger.error(f"No se pudo ejecutar el agente de Upload EasyRoute: {e}")
+        send_notification_email(
+            f"[ALERTA] {AGENT_NAME} - fallo al generar Upload EasyRoute",
+            f"Error al lanzar la generacion de Upload EasyRoute:\n{e}\n\n"
+            f"Carpeta de datos: {base_path}\n"
+            f"Fecha/hora: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        )
+        return False
+
+    for line in (result.stdout or "").splitlines():
+        logger.info(f"[EASYROUTE] {line}")
+    if result.returncode == 0:
+        logger.info("Upload EasyRoute generado correctamente.")
+        return True
+
+    for line in (result.stderr or "").splitlines():
+        logger.error(f"[EASYROUTE] {line}")
+    send_notification_email(
+        f"[ALERTA] {AGENT_NAME} - fallo al generar Upload EasyRoute",
+        f"La generacion de Upload EasyRoute a partir del Maestro Clientes termino con "
+        f"codigo {result.returncode}.\n\n"
+        f"Carpeta de datos: {base_path}\n"
+        f"Fecha/hora: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        f"Salida del agente:\n{result.stdout or ''}\n{result.stderr or ''}\n"
+    )
+    return False
+
 def process_wells_fargo_files(base_path):
     logger.info("=" * 70)
     logger.info(f"Inicio de ejecución - {AGENT_NAME}")
@@ -1626,6 +1688,9 @@ def process_wells_fargo_files(base_path):
 
     # 1.1 Maestro Clientes: merge de Customers_SAP.xlsx + Customers_SAP_Z5.xlsx
     run_customers_master_merge(base_path)
+
+    # 1.2 Upload EasyRoute: filtrado del Maestro Clientes por vendedores DSD
+    run_easyroute_upload(base_path)
     
     input_zip_filename = os.getenv(
         "INPUT_ZIP_FILENAME",
