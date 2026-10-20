@@ -1549,7 +1549,8 @@ def run_customers_master_merge(base_path):
         logger.info("Merge de Maestro Clientes deshabilitado (CUSTOMER_MERGE_ENABLED=false).")
         return True
 
-    agent_dir = os.getenv("CUSTOMER_MERGE_AGENT_PATH", r"C:\AIWorkspace\Customers Master Data").strip()
+    # Por defecto usa la copia local (customers_agent.py en este mismo repo)
+    agent_dir = os.getenv("CUSTOMER_MERGE_AGENT_PATH", "").strip() or os.path.dirname(os.path.abspath(__file__))
     script = os.path.join(agent_dir, "customers_agent.py")
     if not os.path.isfile(script):
         msg = f"No se encontro el agente de merge en {script}"
