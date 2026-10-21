@@ -27,6 +27,7 @@ MAESTRO_SOURCES = {
     "Territory Name": (["sales group description"], 42),
     "Team Leader Code": (["z5 code"], 47),
     "Team Leader Name": (["z5 name"], 48),
+    "Store Type (ABC)": (["abc class.", "abc class"], 29),
 }
 FILTER_ALIAS = "number"
 FILTER_FALLBACK_POS = 38  # Columna AL (Number) en Maestro Clientes
