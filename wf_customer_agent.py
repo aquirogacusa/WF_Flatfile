@@ -78,7 +78,7 @@ def setup_logging():
     logger.info(f"Log de ejecución: {log_file}")
     return logger
 
-def send_notification_email(subject, body, attachment_path=None):
+def send_notification_email(subject, body, attachment_path=None, recipients_env="ALERT_TO"):
     # Envía una notificación por correo usando la configuración SMTP del archivo .env
     smtp_host = os.getenv("SMTP_HOST")
     smtp_port = int(os.getenv("SMTP_PORT", "587"))
@@ -87,14 +87,16 @@ def send_notification_email(subject, body, attachment_path=None):
     use_ssl = os.getenv("SMTP_USE_SSL", "false").strip().lower() in ("1", "true", "yes")
     use_tls = os.getenv("SMTP_USE_TLS", "true").strip().lower() in ("1", "true", "yes")
     mail_from = os.getenv("ALERT_FROM") or smtp_user
-    recipients = [
-        r.strip()
-        for r in os.getenv("ALERT_TO", "").replace(";", ",").split(",")
-        if r.strip()
-    ]
+
+    def parse(value):
+        return [r.strip() for r in value.replace(";", ",").split(",") if r.strip()]
+
+    recipients = parse(os.getenv(recipients_env, ""))
+    if not recipients and recipients_env != "ALERT_TO":
+        recipients = parse(os.getenv("ALERT_TO", ""))
 
     if not smtp_host or not mail_from or not recipients:
-        logger.error("Notificación NO enviada: configure SMTP_HOST, ALERT_FROM y ALERT_TO en el archivo .env")
+        logger.error(f"Notificación NO enviada: configure SMTP_HOST, ALERT_FROM y {recipients_env} en el archivo .env")
         return False
 
     message = MIMEMultipart()
@@ -144,6 +146,11 @@ def notify_failure(step, detail):
         f"Revise el log del agente para más información.\n"
     )
     return send_notification_email(subject, body)
+
+def send_transformation_email(subject, body):
+    # Alerta exclusiva de los procesos de transformacion (Maestro Clientes y
+    # Upload EasyRoute); se envia a ALERT_TO_TRANSFORM y usa ALERT_TO de respaldo.
+    return send_notification_email(subject, body, recipients_env="ALERT_TO_TRANSFORM")
 
 def is_flatfile_empty(df):
     # El archivo se considera vacío si no tiene filas o si ninguna fila trae dato en la llave Auth
@@ -1563,7 +1570,7 @@ def run_customers_master_merge(base_path):
     if not os.path.isfile(script):
         msg = f"No se encontro el agente de merge en {script}"
         logger.error(msg)
-        send_notification_email(
+        send_transformation_email(
             f"[ALERTA] {AGENT_NAME} - fallo al generar Maestro Clientes",
             f"{msg}\n\nFecha/hora: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
         )
@@ -1584,7 +1591,7 @@ def run_customers_master_merge(base_path):
         )
     except Exception as e:
         logger.error(f"No se pudo ejecutar el agente de merge: {e}")
-        send_notification_email(
+        send_transformation_email(
             f"[ALERTA] {AGENT_NAME} - fallo al generar Maestro Clientes",
             f"Error al lanzar el merge de clientes:\n{e}\n\n"
             f"Carpeta de datos: {base_path}\n"
@@ -1600,7 +1607,7 @@ def run_customers_master_merge(base_path):
 
     for line in (result.stderr or "").splitlines():
         logger.error(f"[MERGE] {line}")
-    send_notification_email(
+    send_transformation_email(
         f"[ALERTA] {AGENT_NAME} - fallo al generar Maestro Clientes",
         f"El merge de Customers_SAP.xlsx + Customers_SAP_Z5.xlsx termino con codigo "
         f"{result.returncode}.\n\n"
@@ -1623,7 +1630,7 @@ def run_easyroute_upload(base_path):
     if not os.path.isfile(script):
         msg = f"No se encontro el agente de Upload EasyRoute en {script}"
         logger.error(msg)
-        send_notification_email(
+        send_transformation_email(
             f"[ALERTA] {AGENT_NAME} - fallo al generar Upload EasyRoute",
             f"{msg}\n\nFecha/hora: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
         )
@@ -1644,7 +1651,7 @@ def run_easyroute_upload(base_path):
         )
     except Exception as e:
         logger.error(f"No se pudo ejecutar el agente de Upload EasyRoute: {e}")
-        send_notification_email(
+        send_transformation_email(
             f"[ALERTA] {AGENT_NAME} - fallo al generar Upload EasyRoute",
             f"Error al lanzar la generacion de Upload EasyRoute:\n{e}\n\n"
             f"Carpeta de datos: {base_path}\n"
@@ -1660,7 +1667,7 @@ def run_easyroute_upload(base_path):
 
     for line in (result.stderr or "").splitlines():
         logger.error(f"[EASYROUTE] {line}")
-    send_notification_email(
+    send_transformation_email(
         f"[ALERTA] {AGENT_NAME} - fallo al generar Upload EasyRoute",
         f"La generacion de Upload EasyRoute a partir del Maestro Clientes termino con "
         f"codigo {result.returncode}.\n\n"
