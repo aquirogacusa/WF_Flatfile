@@ -75,6 +75,12 @@ def resolve_maestro_path(env):
         key=os.path.getmtime,
         reverse=True,
     )
+    if not candidates:
+        candidates = sorted(
+            glob.glob(os.path.join(source_folder, "Maestro Clientes*.xlsx")),
+            key=os.path.getmtime,
+            reverse=True,
+        )
     for candidate in candidates:
         if not os.path.basename(candidate).startswith("~$"):
             print(f"No existe el archivo del dia; se usara el mas reciente: {candidate}")

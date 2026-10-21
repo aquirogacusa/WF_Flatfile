@@ -1541,6 +1541,14 @@ def resolve_sap_excel_path(base_path, filename):
             return candidate
     return expected
 
+def resolve_maestro_file_name():
+    # Nombre canonico del archivo Maestro Clientes: lo usa el merge para escribirlo
+    # y Upload EasyRoute para leerlo, para que nunca queden desincronizados.
+    return (os.getenv("CUSTOMER_MERGE_OUTPUT_FILE_NAME", "").strip()
+            or os.getenv("MAESTRO_FILE_NAME", "").strip()
+            or os.getenv("OUTPUT_FILE_NAME", "").strip()
+            or "Maestro Clientes (Pre) {date}.xlsx")
+
 def run_customers_master_merge(base_path):
     # Genera el "Maestro Clientes" combinando Customers_SAP.xlsx + Customers_SAP_Z5.xlsx.
     # Delega en el agente de C:\AIWorkspace\Customers Master Data; un fallo aqui NO
@@ -1565,13 +1573,8 @@ def run_customers_master_merge(base_path):
     env["SOURCE_FOLDER"] = base_path
     env["BASE_FILE_NAME"] = os.getenv("CUSTOMER_MERGE_BASE_FILE_NAME", "Customers_SAP.xlsx")
     env["Z5_FILE_NAME"] = os.getenv("CUSTOMER_MERGE_Z5_FILE_NAME", "Customers_SAP_Z5.xlsx")
-    out_full = os.getenv("CUSTOMER_MERGE_OUTPUT_FILE_NAME", "").strip()
-    if out_full:
-        env["OUTPUT_FILE_NAME"] = out_full
-        env.pop("OUTPUT_BASE_NAME", None)
-    else:
-        env.pop("OUTPUT_FILE_NAME", None)
-        env["OUTPUT_BASE_NAME"] = os.getenv("CUSTOMER_MERGE_OUTPUT_BASE_NAME", "Maestro Clientes")
+    env["OUTPUT_FILE_NAME"] = resolve_maestro_file_name()
+    env.pop("OUTPUT_BASE_NAME", None)
 
     logger.info("Generando Maestro Clientes (merge SAP + Z5)...")
     try:
@@ -1628,9 +1631,7 @@ def run_easyroute_upload(base_path):
 
     env = os.environ.copy()
     env["SOURCE_FOLDER"] = base_path
-    maestro_name = os.getenv("CUSTOMER_MERGE_OUTPUT_FILE_NAME", "").strip()
-    if maestro_name:
-        env["MAESTRO_FILE_NAME"] = maestro_name
+    env["MAESTRO_FILE_NAME"] = resolve_maestro_file_name()
     upload_name = os.getenv("EASYROUTE_OUTPUT_FILE_NAME", "").strip()
     if upload_name:
         env["UPLOAD_FILE_NAME"] = upload_name
