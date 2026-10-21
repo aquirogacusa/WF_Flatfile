@@ -8,6 +8,10 @@ setlocal
 ::            la red, Windows mostrara el aviso de SmartScreen
 ::            en cada ejecucion.
 :: DATA_PATH: carpeta de los DATOS (zip/csv), configurada en .env.
+:: NOTE: el copiado de Customers_SAP.xlsx / Customers_SAP_Z5.xlsx hacia
+::       SOURCE_FOLDER ya NO se hace aqui; el propio wf_customer_agent.py
+::       los copia antes de generar el Maestro Clientes y el Upload
+::       EasyRoute, para que usen siempre la extraccion mas reciente.
 :: ==========================================================
 set "PROG_PATH=%~dp0"
 set "PYTHON_EXE=C:\Users\artur\AppData\Local\Python\bin\python.exe"
@@ -32,4 +36,9 @@ if exist "%PYTHON_EXE%" (
 
 echo.
 echo Proceso finalizado. Codigo de salida: %errorlevel%
-pause
+
+echo Copiados adicionales
+:: Temporal, deshabilitar cuando se confirme la migracion.
+COPY "\\SIAPBI023AWS\pbi_08_uc\SAPBO_CUSAFiles\NCUCcurpowbi\Wells Fargo Bill File.zip" "\\ncpbi023\POWERBI\SAPBO_CUSAFiles\NCUCcurpowbi\Wells Fargo Bill File.zip" /Y
+
+:: pause

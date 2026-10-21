@@ -1556,6 +1556,40 @@ def resolve_maestro_file_name():
             or os.getenv("OUTPUT_FILE_NAME", "").strip()
             or "Maestro Clientes (Pre) {date}.xlsx")
 
+def get_transformation_folder(base_path):
+    # Las transformaciones (Maestro Clientes / Upload EasyRoute) corren sobre
+    # SOURCE_FOLDER del .env si esta definida; si no, sobre la carpeta de datos WF.
+    folder = os.getenv("SOURCE_FOLDER", "").strip()
+    if not folder:
+        return base_path
+    if os.path.normcase(os.path.abspath(folder)) == os.path.normcase(os.path.abspath(base_path)):
+        return base_path
+    return folder
+
+def sync_sap_files_for_transform(base_path, target_folder):
+    # Copia los Customers_SAP*.xlsx recien extraidos hacia la carpeta de las
+    # transformaciones cuando esta es distinta de DATA_PATH (asi el merge y el
+    # Upload EasyRoute siempre usan la extraccion mas reciente del dia).
+    if target_folder == base_path:
+        return
+    try:
+        os.makedirs(target_folder, exist_ok=True)
+    except Exception as e:
+        logger.warning(f"[TRANSFORM] No se pudo crear {target_folder}: {e}")
+        return
+    for fname in (os.getenv("CUSTOMER_MERGE_BASE_FILE_NAME", "Customers_SAP.xlsx").strip(),
+                  os.getenv("CUSTOMER_MERGE_Z5_FILE_NAME", "Customers_SAP_Z5.xlsx").strip()):
+        src = resolve_sap_excel_path(base_path, fname)
+        if not os.path.isfile(src):
+            logger.warning(f"[TRANSFORM] No existe {src} para copiar; se omite.")
+            continue
+        dst = os.path.join(target_folder, os.path.basename(src))
+        try:
+            shutil.copy2(src, dst)
+            logger.info(f"[TRANSFORM] Copiado {src} -> {dst}")
+        except Exception as e:
+            logger.warning(f"[TRANSFORM] No se pudo copiar {src} a {dst}: {e}")
+
 def run_customers_master_merge(base_path):
     # Genera el "Maestro Clientes" combinando Customers_SAP.xlsx + Customers_SAP_Z5.xlsx.
     # Delega en el agente de C:\AIWorkspace\Customers Master Data; un fallo aqui NO
@@ -1576,8 +1610,10 @@ def run_customers_master_merge(base_path):
         )
         return False
 
+    target_folder = get_transformation_folder(base_path)
+    sync_sap_files_for_transform(base_path, target_folder)
     env = os.environ.copy()
-    env["SOURCE_FOLDER"] = base_path
+    env["SOURCE_FOLDER"] = target_folder
     env["BASE_FILE_NAME"] = os.getenv("CUSTOMER_MERGE_BASE_FILE_NAME", "Customers_SAP.xlsx")
     env["Z5_FILE_NAME"] = os.getenv("CUSTOMER_MERGE_Z5_FILE_NAME", "Customers_SAP_Z5.xlsx")
     env["OUTPUT_FILE_NAME"] = resolve_maestro_file_name()
@@ -1594,7 +1630,7 @@ def run_customers_master_merge(base_path):
         send_transformation_email(
             f"[ALERTA] {AGENT_NAME} - fallo al generar Maestro Clientes",
             f"Error al lanzar el merge de clientes:\n{e}\n\n"
-            f"Carpeta de datos: {base_path}\n"
+            f"Carpeta de datos: {target_folder}\n"
             f"Fecha/hora: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
         )
         return False
@@ -1611,7 +1647,7 @@ def run_customers_master_merge(base_path):
         f"[ALERTA] {AGENT_NAME} - fallo al generar Maestro Clientes",
         f"El merge de Customers_SAP.xlsx + Customers_SAP_Z5.xlsx termino con codigo "
         f"{result.returncode}.\n\n"
-        f"Carpeta de datos: {base_path}\n"
+        f"Carpeta de datos: {target_folder}\n"
         f"Fecha/hora: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
         f"Salida del agente:\n{result.stdout or ''}\n{result.stderr or ''}\n"
     )
@@ -1636,8 +1672,10 @@ def run_easyroute_upload(base_path):
         )
         return False
 
+    target_folder = get_transformation_folder(base_path)
+    sync_sap_files_for_transform(base_path, target_folder)
     env = os.environ.copy()
-    env["SOURCE_FOLDER"] = base_path
+    env["SOURCE_FOLDER"] = target_folder
     env["MAESTRO_FILE_NAME"] = resolve_maestro_file_name()
     upload_name = os.getenv("EASYROUTE_OUTPUT_FILE_NAME", "").strip()
     if upload_name:
@@ -1654,7 +1692,7 @@ def run_easyroute_upload(base_path):
         send_transformation_email(
             f"[ALERTA] {AGENT_NAME} - fallo al generar Upload EasyRoute",
             f"Error al lanzar la generacion de Upload EasyRoute:\n{e}\n\n"
-            f"Carpeta de datos: {base_path}\n"
+            f"Carpeta de datos: {target_folder}\n"
             f"Fecha/hora: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
         )
         return False
@@ -1671,7 +1709,7 @@ def run_easyroute_upload(base_path):
         f"[ALERTA] {AGENT_NAME} - fallo al generar Upload EasyRoute",
         f"La generacion de Upload EasyRoute a partir del Maestro Clientes termino con "
         f"codigo {result.returncode}.\n\n"
-        f"Carpeta de datos: {base_path}\n"
+        f"Carpeta de datos: {target_folder}\n"
         f"Fecha/hora: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
         f"Salida del agente:\n{result.stdout or ''}\n{result.stderr or ''}\n"
     )
